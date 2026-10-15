@@ -123,3 +123,8 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Verwende Benutzerkonto als benutzerdefiniertes Benutzerkonto-Modell
 AUTH_USER_MODEL = 'vp_stunden.Benutzerkonto'
 
+
+# Sicherheitskonfigurationen für QA02
+ANMELDE_MAX_FEHLVERSUCHE = 5  # Maximale Anzahl der fehlgeschlagenen Anmeldeversuche
+ANMELDE_FENSTER_SEKUNDEN = 15 * 60  # Zeitfenster in Sekunden (15 Minuten)
+ANMELDE_SPERRDAUER_SEKUNDEN = 5 * 60  # Sperrdauer in Sekunden (5 Minuten)
