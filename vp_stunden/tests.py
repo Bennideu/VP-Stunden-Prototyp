@@ -1,292 +1,598 @@
-from unittest.mock import patch # Bibliothek für das Mocking von Funktionen und Methoden
+# Anforderungsbezogene Tests für Passwörter, Benutzerkonten und Anmeldebegrenzung
 
-from django.contrib.auth.password_validation import validate_password # Bibliothek für Passwortvalidierung
-from django.core.exceptions import ValidationError # Bibliothek für Fehlerbehandlung
-from django.http import HttpRequest
-from django.test import SimpleTestCase
-from django.utils import timezone # Bibliothek für Unit-Tests ohne Datenbankzugriff
-from vp_stunden.models import Benutzerkonto # Import des benutzerdefinierten Benutzerkontos-Modells
-from django.contrib.auth.hashers import get_hasher # Import der Passwort-Hashing-Funktion
-from django.test import TestCase
+from unittest.mock import patch  # Funktionen während eines Tests gezielt ersetzen
 
-from vp_stunden.sicherheit import lege_konto_an, melde_an  # Bibliothek für Unit-Tests mit Datenbankzugriff
-from vp_stunden.sicherheit import setze_passwort_zurueck  # Bibliothek für Unit-Tests mit Datenbankzugriff
+from django.contrib.auth.password_validation import validate_password  # Die konfigurierten Django-Passwortregeln prüfen
+from django.core.exceptions import ValidationError  # Ausnahme bei verletzten Validierungsregeln
+from django.http import HttpRequest  # HTTP-Anfrageobjekte für direkte Funktionstests erzeugen
+from django.test import SimpleTestCase  # Django-Testklasse ohne Datenbankzugriff
+from django.utils import timezone  # Zeitzonenbewusste Zeitpunkte und Zeitabstände verwenden
+from vp_stunden.models import Benutzerkonto  # Das benutzerdefinierte Kontenmodell verwenden
+from django.contrib.auth.hashers import get_hasher  # Den konfigurierten Passwort-Hasher abrufen
+from django.test import TestCase  # Django-Testklasse für Tests mit Datenbankzugriff
 
-# Testklasse für die Passwortvalidierung
+from vp_stunden.sicherheit import lege_konto_an, melde_an  # Zu prüfende Funktionen zur Kontenanlage und Anmeldung
+from vp_stunden.sicherheit import setze_passwort_zurueck  # Zu prüfende Funktion zum Passwortzurücksetzen
+
+
+# Passwortlängen und erlaubte Zeichenfolgen nach QA-01 prüfen
 class PasswortregelnTests(SimpleTestCase):
 
-    # Test für die Passwortlänge: 14 Zeichen sollten abgewiesen werden
+
+    # 14 Zeichen unterschreiten die Mindestlänge und müssen abgewiesen werden
     def test_qa01_14_zeichen_werden_abgewiesen(self):
         with self.assertRaises(ValidationError):
-            validate_password('a' * 14)
+            validate_password('a' * 14)  # Die Validierung muss eine Ausnahme auslösen
 
-    # Test für die Passwortlänge: 15 Zeichen sollten akzeptiert werden
+
+    # Die Mindestlänge von 15 Zeichen muss akzeptiert werden
     def test_qa01_15_zeichen_werden_akzeptiert(self):
         self.assertIsNone(validate_password('a' * 15))
 
-    # Test für die Passwortlänge: 64 Zeichen sollten akzeptiert werden
+
+    # Ein Passwort mit 64 Zeichen muss unterstützt werden
     def test_qa01_64_zeichen_werden_akzeptiert(self):
         self.assertIsNone(validate_password('a' * 64))
 
-    # Test für die Passwortlänge: 65 Zeichen sollten akzeptiert werden
+
+    # Auch 65 Zeichen werden ohne zusätzliche 64-Zeichen-Obergrenze akzeptiert
     def test_qa01_65_zeichen_werden_akzeptiert(self):
         self.assertIsNone(validate_password('a' * 65))
 
-    # Test für die Passwortzeichen: Reines Zahlenpasswort sollte akzeptiert werden
+
+    # Ein ausreichend langes Zahlenpasswort muss ohne Zeichenklassenregeln akzeptiert werden
     def test_qa01_reines_zahlenpasswort_wird_akzeptiert(self):
-        self.assertIsNone(validate_password('123456789012345'))  # Reines Zahlenpasswort, sollte akzeptiert werden
+        self.assertIsNone(validate_password('123456789012345'))
 
 
-# Testklasse für das Passwort-Hashing und die Passwortüberprüfung
+
+# Hashvergleich, Argon2id-Parameter und individuellen Salt prüfen
 class PasswortHashingTests(SimpleTestCase):
 
-    # Test für das Passwort-Hashing und die Passwortüberprüfung
+
+    # Richtiges und falsches Passwort, Hashparameter und unterschiedliche Salts prüfen
     def test_qa01_passwortvergleich(self):
+        # Synthetische Testwerte vorbereiten
         testpasswort = 'a' * 64
         konto = Benutzerkonto(username='testuser', rolle=Benutzerkonto.LEHRPERSON)
-        konto.set_password(testpasswort)  # Passwort wird gehasht und im Benutzerkonto gespeichert
-        self.assertNotEqual(konto.password, testpasswort)  # Das gespeicherte Passwort sollte nicht dem Klartext-Passwort entsprechen
-        self.assertTrue(konto.check_password(testpasswort))  # Überprüfung, ob das gehashte Passwort mit dem Klartext-Passwort übereinstimmt
+        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
+        self.assertNotEqual(konto.password, testpasswort)
+        self.assertTrue(konto.check_password(testpasswort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
 
-        # Testen eines falschen Passworts
+
         testpasswort_falsch = 'a' * 63 + 'b'
-        self.assertFalse(konto.check_password(testpasswort_falsch))  # Überprüfung,
-
-        # Testen des Passwort-Hashing-Algorithmus und der Parameter
-        hasher = get_hasher()  # Abrufen des Passwort-Hashers
-        hasher_decoded = hasher.decode(konto.password)  # Hashbestandteile auslesen
-        self.assertEqual(hasher_decoded['algorithm'], 'argon2')  # Überprüfung, ob der verwendete Algorithmus Argon2 ist
-        self.assertEqual(hasher_decoded['time_cost'], 2)  # Überprüfung der Anzahl der Iterationen
-        self.assertEqual(hasher_decoded['memory_cost'], 102400)  # Überprüfung der Speichergröße
-        self.assertEqual(hasher_decoded['parallelism'], 8)  # Überprüfung der Parallelität
-        self.assertEqual(hasher_decoded['variety'], 'argon2id')  # Überprüfung der Varietät des Hashing-Algorithmus
-
-        # Vergleich der Salts, bei zweimaligem Hashing sollten unterschiedliche Salts verwendet werden
-        konto.set_password(testpasswort)  # Passwort wird erneut gehasht
-        hasher_decoded_neu = hasher.decode(konto.password)  # Hashbestandteile auslesen des neuen gehashten Passworts
-        self.assertNotEqual(hasher_decoded['salt'], hasher_decoded_neu['salt'])  # Überprüfung, ob die Salts
+        self.assertFalse(konto.check_password(testpasswort_falsch))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
 
 
-# Testklasse für die Speicherung des Passwort-Hashes in der Datenbank
+        # Den konfigurierten Standard-Hasher und seine Parameter prüfen
+        hasher = get_hasher()  # Hasher-Objekt abrufen
+        hasher_decoded = hasher.decode(konto.password)  # Algorithmus, Parameter und Salt aus dem kodierten Hash auslesen
+        self.assertEqual(hasher_decoded['algorithm'], 'argon2')  # Den konfigurierten Hashalgorithmus prüfen
+        self.assertEqual(hasher_decoded['time_cost'], 2)  # Die Anzahl der Iterationen prüfen
+        self.assertEqual(hasher_decoded['memory_cost'], 102400)  # Den Speicherparameter in KiB prüfen
+        self.assertEqual(hasher_decoded['parallelism'], 8)  # Den Parallelitätsparameter prüfen
+        self.assertEqual(hasher_decoded['variety'], 'argon2id')  # Argon2id als verwendete Variante prüfen
+
+
+        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
+        hasher_decoded_neu = hasher.decode(konto.password)  # Algorithmus, Parameter und Salt aus dem kodierten Hash auslesen
+        # Beim erneuten Hashen desselben Passworts müssen sich die Salts unterscheiden
+        self.assertNotEqual(hasher_decoded['salt'], hasher_decoded_neu['salt'])
+
+
+
+# Die Speicherung des Passwort-Hashes in der Datenbank prüfen
 class PasswortspeicherungTests(TestCase):
 
-    # Test für die Speicherung des Passwort-Hashes in der Datenbank
+
+    # Den gespeicherten Hash erneut aus der Datenbank laden und vergleichen
     def test_qa01_hash_wird_gespeichert(self):
+        # Synthetische Testwerte vorbereiten
         testpasswort = 'a' * 64
         konto = Benutzerkonto(username='testuser', rolle=Benutzerkonto.LEHRPERSON)
-        konto.set_password(testpasswort)  # Passwort wird gehasht und im Benutzerkonto gespeichert
-        passwort_hash = konto.password  # Abrufen des gespeicherten Passwort-Hashes
-        konto.save()  # Speichern des Benutzerkontos in der Datenbank
-        konto_aus_db = Benutzerkonto.objects.get(username='testuser')  # Abrufen des Benutzerkontos aus der Datenbank
-        self.assertEqual(konto_aus_db.password, passwort_hash)  # Überprüfung, ob der gespeicherte Passwort-Hash mit dem aus der Datenbank übereinstimmt
-        self.assertFalse(konto_aus_db.password == testpasswort)  # Überprüfung, dass der gespeicherte Passwort-Hash nicht dem Klartext-Passwort entspricht
-        self.assertTrue(konto_aus_db.check_password(testpasswort))  # Überprüfung, ob das gehashte Passwort mit dem Klartext-Passwort übereinstimmt
+        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
+        passwort_hash = konto.password
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        # Das gespeicherte Konto erneut aus der Datenbank laden
+        konto_aus_db = Benutzerkonto.objects.get(username='testuser')
+        self.assertEqual(konto_aus_db.password, passwort_hash)
+        self.assertFalse(konto_aus_db.password == testpasswort)
+        self.assertTrue(konto_aus_db.check_password(testpasswort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
 
 
-# Testklasse für die Erstellung eines Benutzerkontos
+
+# Kontenanlage und Abweisung ungültiger Eingaben nach FA-02 und QA-01 prüfen
 class KontoErstellungTests(TestCase):
 
-    # Test für die Erstellung eines Benutzerkontos mit einem zu kurzen Passwort
+
+    # Ein zu kurzes Passwort muss ohne Kontospeicherung abgewiesen werden
     def test_qa01_kurzes_passwort_verhindert_kontoerstellung(self):
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 14  # Kurzes Passwort, das die Mindestanforderungen nicht erfüllt
+        passwort = 'a' * 14
         rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)  # Versuch, ein Konto mit einem kurzen Passwort zu erstellen
-        self.assertIsNone(konto)  # Überprüfung, dass kein Konto erstellt wurde
-        self.assertTrue(fehlerliste)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())  # Überprüfung, dass kein Konto in der Datenbank existiert
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNone(konto)
+        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
+        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
 
-    # Test für die erfolgreiche Erstellung eines Benutzerkontos mit einem gültigen Passwort
+
+    # Kontenanlage sowie gespeicherten Benutzernamen, Rolle und Passwort-Hash prüfen
     def test_fa02_erfolgreiche_kontoerstellung(self):
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)  # Versuch, ein Konto mit einem gültigen Passwort zu erstellen
-        self.assertIsNotNone(konto)  # Überprüfung, dass ein Konto erstellt wurde
-        self.assertFalse(fehlerliste)  # Überprüfung, dass keine Fehlerliste zurückgegeben wurde
-        self.assertTrue(Benutzerkonto.objects.filter(username=benutzername).exists())  # Überprüfung, dass das Konto in der Datenbank existiert
-
-        benutzerkonto_aus_db = Benutzerkonto.objects.get(username=benutzername)  # Abrufen des Benutzerkontos aus der Datenbank
-        self.assertTrue(benutzerkonto_aus_db.check_password(passwort))  # Überprüfung, ob das gehashte Passwort mit dem Klartext-Passwort übereinstimmt
-        self.assertEqual(benutzerkonto_aus_db.rolle, rolle)  # Überprüfung, ob die Rolle des Benutzerkontos korrekt gespeichert wurde
-        self.assertNotEqual(benutzerkonto_aus_db.password, passwort)  # Überprüfung, dass der gespeicherte Passwort-Hash nicht dem Klartext-Passwort entspricht
-        self.assertEqual(benutzerkonto_aus_db.username, benutzername)  # Überprüfung, dass der Benutzername korrekt gespeichert wurde
-
-
-    # Test für die Erstellung eines Benutzerkontos mit einer ungültigen Rolle
-    def test_fa02_ungueltige_rolle_verhindert_kontoerstellung(self):
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
-        rolle = 'ungültig'  # Ungültige Rolle
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)  # Versuch, ein Konto mit einer ungültigen Rolle zu erstellen
-        self.assertIsNone(konto)  # Überprüfung, dass kein Konto erstellt wurde
-        self.assertTrue(fehlerliste)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())  # Überprüfung, dass kein Konto in der Datenbank existiert
-
-    def test_fa02_doppelte_benutzername_verhindert_kontoerstellung(self):
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
-        rolle = Benutzerkonto.LEHRPERSON
-        # Erstelle das erste Konto
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertTrue(Benutzerkonto.objects.filter(username=benutzername).exists())
 
-        # Versuche, ein zweites Konto mit demselben Benutzernamen zu erstellen
+        # Das gespeicherte Konto erneut aus der Datenbank laden
+        benutzerkonto_aus_db = Benutzerkonto.objects.get(username=benutzername)
+        self.assertTrue(benutzerkonto_aus_db.check_password(passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
+        self.assertEqual(benutzerkonto_aus_db.rolle, rolle)
+        self.assertNotEqual(benutzerkonto_aus_db.password, passwort)
+        self.assertEqual(benutzerkonto_aus_db.username, benutzername)
+
+
+
+    # Eine unzulässige Rolle muss ohne Kontospeicherung abgewiesen werden
+    def test_fa02_ungueltige_rolle_verhindert_kontoerstellung(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = 'ungültig'
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNone(konto)
+        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
+        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
+
+    # Zwei aufeinanderfolgende Anlageversuche dürfen nur ein Konto mit diesem Namen speichern
+    def test_fa02_doppelte_benutzername_verhindert_kontoerstellung(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+
         konto2, fehlerliste2 = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNone(konto2)
-        self.assertTrue(fehlerliste2)
+        self.assertTrue(fehlerliste2)  # Mindestens eine Fehlermeldung erwarten
         self.assertTrue(Benutzerkonto.objects.filter(username=benutzername).count() == 1)
 
 
+# Passwortzurücksetzen und unveränderten Bestand bei Fehlern prüfen
 class PasswortZuruecksetzenTests(TestCase):
 
-    # Test für das Zurücksetzen des Passworts eines bestehenden Benutzerkontos
+
+    # Das neue Passwort muss nach dem Zurücksetzen gültig und das bisherige ungültig sein
     def test_fa02_passwort_zuruecksetzen(self):
-        # Erstelle ein Benutzerkonto
+
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
 
-        # Setze das Passwort zurück
-        neues_passwort = 'b' * 64  # Neues gültiges Passwort
+
+        neues_passwort = 'b' * 64
+        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto.pk, neues_passwort)
-        self.assertFalse(fehlerliste_zuruecksetzen)  # Überprüfung, dass keine Fehlerliste zurückgegeben wurde
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
-        self.assertTrue(konto.check_password(neues_passwort))  # Überprüfung, ob das gehashte Passwort mit dem neuen Klartext-Passwort übereinstimmt
-        self.assertFalse(konto.check_password(passwort))  # Überprüfung, dass das alte Passwort nicht mehr gültig ist
+        self.assertFalse(fehlerliste_zuruecksetzen)  # Eine leere Fehlerliste erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(konto.check_password(neues_passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
+        self.assertFalse(konto.check_password(passwort))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
 
-    # Test für das Zurücksetzen des Passworts mit einem zu kurzen Passwort
+
+    # Ein zu kurzes neues Passwort muss den bisherigen gespeicherten Hash unverändert lassen
     def test_qa01_zu_kurzes_passwort_laesst_altes_passwort_unveraendert(self):
-        # Erstelle ein Benutzerkonto
+
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
 
-        # Versuche, das Passwort mit einem zu kurzen Passwort zurückzusetzen
-        zu_kurzes_passwort = 'c' * 14  # Zu kurzes Passwort
-        passwort_hash_vorher = konto.password  # Speichere den Passwort-Hash vor dem Zurücksetzen
+
+        zu_kurzes_passwort = 'c' * 14
+        passwort_hash_vorher = konto.password
+        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto.pk, zu_kurzes_passwort)
-        self.assertTrue(fehlerliste_zuruecksetzen)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
-        self.assertEqual(konto.password, passwort_hash_vorher)  # Überprüfung, dass der Passwort-Hash unverändert geblieben ist
-        self.assertTrue(konto.check_password(passwort))  # Überprüfung, dass das alte Passwort weiterhin gültig ist
-        self.assertFalse(konto.check_password(zu_kurzes_passwort))  # Überprüfung, dass das zu kurze Passwort nicht gültig ist
+        self.assertTrue(fehlerliste_zuruecksetzen)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.password, passwort_hash_vorher)
+        self.assertTrue(konto.check_password(passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
+        self.assertFalse(konto.check_password(zu_kurzes_passwort))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
 
 
+    # Das Zurücksetzen für eine nachweislich fehlende Konto-ID muss abgewiesen werden
     def test_fa02_nicht_vorhandenes_konto_wird_abgewiesen(self):
-        # Versuche, das Passwort für ein nicht vorhandenes Konto zurückzusetzen
-        konto_id = 1  # ID eines nicht vorhandenen Kontos
-        self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())  # Überprüfung, dass das Konto nicht existiert
-        neues_passwort = 'b' * 64  # Neues gültiges Passwort
+
+        konto_id = 1
+        self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())
+        neues_passwort = 'b' * 64
+        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto_id, neues_passwort)
-        self.assertTrue(fehlerliste_zuruecksetzen)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())  # Überprüfung, dass das Konto weiterhin nicht existiert
+        self.assertTrue(fehlerliste_zuruecksetzen)  # Mindestens eine Fehlermeldung erwarten
+        self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())
 
 
+# Fehlversuchsschwelle, feste Zeitfenster, Sperren und Rücksetzregeln nach QA-02 prüfen
 class AnmeldeTests(TestCase):
 
+    # Eine aktive Sperre muss auch das richtige Passwort abweisen und ihr Ende beibehalten
     def test_qa02_aktive_sperre_verhindert_anmeldung(self):
-        # Erstelle ein Benutzerkonto
+
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
 
-        # Sperre das Konto für 5 Minuten
-        konto.gesperrt_bis = timezone.now() + timezone.timedelta(minutes=5)  # Sperre das Konto für 5 Minuten
-        sperrende_vorher = konto.gesperrt_bis  # Speichere den Zeitpunkt, bis zu dem das Konto gesperrt ist
-        konto.save()
 
-        # Versuche, sich während der Sperrzeit anzumelden
+        # Eine bestehende aktive Sperre vorbereiten
+        konto.gesperrt_bis = timezone.now() + timezone.timedelta(minutes=5)
+        sperrende_vorher = konto.gesperrt_bis
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+
         anfrage = HttpRequest()
+        # Den Anmeldeversuch mit dem vorbereiteten Konto ausführen
         fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertTrue(fehlerliste_anmeldung)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        self.assertIn("Anmeldung fehlgeschlagen", fehlerliste_anmeldung[0])  # Überprüfung, dass die Fehlermeldung "Anmeldung fehlgeschlagen" enthalten ist
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        self.assertIn("Anmeldung fehlgeschlagen", fehlerliste_anmeldung[0])
 
-        # Überprüfung, dass der Zeitpunkt, bis zu dem das Konto gesperrt ist, unverändert geblieben ist
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
+
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
         self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
 
+    # Genau am Sperrende muss der gespeicherte Fehlversuchs- und Sperrzustand zurückgesetzt werden
     def test_qa02_sperrende_setzt_sperrzustand_zurueck(self):
-        # Erstelle ein Benutzerkonto
+
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
 
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
-        konto.fehlversuche = 5  # Setze die Anzahl der fehlgeschlagenen Anmeldeversuche auf 5
-        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=10)  # Setze den Beginn des Zeitraums der fehlgeschlagenen Anmeldeversuche auf 10 Minuten vor dem aktuellen Zeitpunkt
-        konto.gesperrt_bis = testzeitpunkt # Setze den Zeitpunkt, bis zu dem das Konto gesperrt ist, auf den aktuellen Zeitpunkt
-        konto.save()
+        konto.fehlversuche = 5
+        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=10)
+        konto.gesperrt_bis = testzeitpunkt
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
 
-        # Versuche, sich nach Ablauf der Sperrzeit anzumelden
+
         anfrage = HttpRequest()
+        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
             fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Überprüfung, dass keine Fehlerliste zurückgegeben wurde
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
-        self.assertIsNone(konto.gesperrt_bis)  # Überprüfung, dass der Zeitpunkt, bis zu dem das Konto gesperrt ist, auf None zurückgesetzt wurde
-        self.assertEqual(konto.fehlversuche, 0)  # Überprüfung, dass die Anzahl der fehlgeschlagenen Anmeldeversuche auf 0 zurückgesetzt wurde
-        self.assertIsNone(konto.fehlversuchszeitraum_beginn)  # Überprüfung, dass der Beginn des Zeitraums der fehlgeschlagenen Anmeldeversuche auf None zurückgesetzt wurde
-
-
-    def test_qa02_fensterende_setzt_fehlversuche_zurueck(self):
-        # Erstelle ein Benutzerkonto
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
-
-        testzeitpunkt = timezone.now()
-        konto.fehlversuche = 3  # Setze die Anzahl der fehlgeschlagenen Anmeldeversuche auf 3
-        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=15)  # Setze den Beginn des Zeitraums der fehlgeschlagenen Anmeldeversuche auf 10 Minuten vor dem aktuellen Zeitpunkt
-        konto.save()
-
-        # Versuche, sich nach Ablauf des Zeitraums der fehlgeschlagenen Anmeldeversuche anzumelden
-        anfrage = HttpRequest()
-        with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Überprüfung, dass keine Fehlerliste zurückgegeben wurde
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
-        self.assertEqual(konto.fehlversuche, 0)  # Überprüfung, dass die Anzahl der fehlgeschlagenen Anmeldeversuche auf 0 zurückgesetzt wurde
+        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertIsNone(konto.gesperrt_bis)
+        self.assertEqual(konto.fehlversuche, 0)
         self.assertIsNone(konto.fehlversuchszeitraum_beginn)
-        self.assertIsNone(konto.gesperrt_bis)  # Überprüfung, dass der Zeitpunkt, bis zu dem das Konto gesperrt ist, auf None zurückgesetzt wurde
 
-    def test_qa02_fuenfter_fehlversuch_sperrt_fuenf_minuten(self):
-        # Erstelle ein Benutzerkonto
+
+    # Genau am Ende des 15-Minuten-Fensters muss die bisherige Zählung zurückgesetzt werden
+    def test_qa02_fensterende_setzt_fehlversuche_zurueck(self):
+
+        # Synthetische Testwerte vorbereiten
         benutzername = 'testnutzer'
-        passwort = 'a' * 64  # Gültiges Passwort, das die Mindestanforderungen erfüllt
+        passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
 
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 3
+        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=15)
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+
+        anfrage = HttpRequest()
+        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 0)
+        self.assertIsNone(konto.fehlversuchszeitraum_beginn)
+        self.assertIsNone(konto.gesperrt_bis)
+
+    # Der fünfte Fehlversuch innerhalb des Fensters muss eine fünfminütige Sperre auslösen
+    def test_qa02_fuenfter_fehlversuch_sperrt_fuenf_minuten(self):
+
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.LEHRPERSON
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=1)
 
-        konto.fehlversuche = 4  # Setze die Anzahl der fehlgeschlagenen Anmeldeversuche auf 4
-        konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher  # Setze den Beginn des Zeitraums der fehlgeschlagenen Anmeldeversuche auf den aktuellen Zeitpunkt
-        konto.save()
+        konto.fehlversuche = 4
+        konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
 
         anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, 'falsches_passwort')  # Versuche, sich mit einem falschen Passwort anzumelden
-        self.assertTrue(fehlerliste_anmeldung)  # Überprüfung, dass eine Fehlerliste zurückgegeben wurde
-        konto.refresh_from_db()  # Aktualisiere das Konto aus der Datenbank
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, 'falsches_passwort')
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
         self.assertEqual(konto.fehlversuche,5)
         self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher)
         self.assertEqual(testzeitpunkt + timezone.timedelta(minutes=5),konto.gesperrt_bis)
+
+
+    # Der vierte Fehlversuch muss gezählt werden und darf noch keine Sperre auslösen
+    def test_qa02_vierter_fehlversuch_sperrt_nicht(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.LEHRPERSON
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 3
+        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=1)
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
+            fehlerliste = melde_an(anfrage, benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
+
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche,4)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt - timezone.timedelta(minutes=1))
+        self.assertIsNone(konto.gesperrt_bis)
+
+
+    # Ein weiterer Versuch während der Sperre darf Zähler, Fensterbeginn und Sperrende nicht ändern
+    def test_qa02_sechster_Versuch_verlaengert_sperre_nicht(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.LEHRPERSON
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 5
+        konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=2)
+        sperrende_vorher = testzeitpunkt + timezone.timedelta(minutes=4)
+        konto.gesperrt_bis = sperrende_vorher
+
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
+            fehlerliste = melde_an(anfrage, benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche,5)
+        self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt - timezone.timedelta(minutes=2))
+
+
+    # Ein falsches Passwort genau am Fensterende muss als erster Versuch eines neuen Fensters zählen
+    def test_qa02_fehlversuch_am_fensterende_beginnt_neues_fenster(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 4
+        konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=15))
+        konto.gesperrt_bis = None
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 1)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
+        self.assertIsNone(konto.gesperrt_bis)
+
+
+    # Eine Sekunde vor Fensterende müssen die vier bisherigen Fehlversuche noch zählen
+    def test_qa02_fehlversuch_kurz_vor_fensterende_sperrt(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=14, seconds=59)
+
+        konto.fehlversuche = 4
+        konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
+        konto.gesperrt_bis = None
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort= 'falschesPW')
+
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 5)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher,)
+        self.assertEqual(konto.gesperrt_bis,testzeitpunkt + timezone.timedelta(minutes=5))
+
+
+
+    # Eine Sekunde nach Fensterende muss ein neues Fenster mit einem Fehlversuch beginnen
+    def test_qa02_fehlversuch_nach_fensterende_beginnt_neues_fenster(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 4
+        konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=15, seconds=1))
+        konto.gesperrt_bis = None
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort='falschesPW')
+
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 1)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
+        self.assertIsNone(konto.gesperrt_bis)
+
+    # Eine Sekunde vor Sperrende muss das richtige Passwort weiterhin abgewiesen werden
+    def test_qa02_kurz_vor_sperrende_bleibt_konto_gesperrt(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=10)
+        sperrende_vorher = testzeitpunkt + timezone.timedelta(seconds=1)
+
+        konto.fehlversuche = 5
+        konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
+        konto.gesperrt_bis = sperrende_vorher
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 5)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher,)
+        self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
+
+    # Nach Sperrende muss ein falsches Passwort eine neue Zählung beginnen
+    def test_qa02_fehlversuch_nach_sperrende_beginnt_neues_fenster(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 5
+        konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=10))
+        konto.gesperrt_bis = testzeitpunkt - timezone.timedelta(seconds=1)
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort= 'falschesPW')
+
+        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 1)
+        self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
+        self.assertIsNone(konto.gesperrt_bis)
+
+
+    # Ein richtiges Passwort muss die Zählung auch innerhalb eines noch laufenden Fensters zurücksetzen
+    def test_qa02_richtiges_passwort_setzt_fehlversuche_zurueck(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 15
+        rolle = Benutzerkonto.LEHRPERSON
+
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        testzeitpunkt = timezone.now()
+        konto.fehlversuche = 4
+        konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=1))
+        konto.gesperrt_bis = None
+        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+
+        anfrage = HttpRequest()
+        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
+            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+
+        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
+        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertEqual(konto.fehlversuche, 0)
+        self.assertIsNone(konto.fehlversuchszeitraum_beginn)
+        self.assertIsNone(konto.gesperrt_bis)

@@ -1,11 +1,10 @@
+from django.core.exceptions import ValidationError  # Ausnahme bei ungültigen Eingaben
+from django.conf import settings  # Zugriff auf die konfigurierten Anmeldegrenzen
+from django.contrib.auth import login  # Anmeldung über Djangos Sitzungsverwaltung
 from django.contrib.auth.password_validation import validate_password # Bibliothek für Passwortvalidierung
-from django.core.exceptions import ValidationError
-
-from django.conf import settings # Bibliothek für Fehlerbehandlung
 from .models import Benutzerkonto # Import des benutzerdefinierten Benutzerkontos-Modells
 from django.http import HttpRequest # Import für die Verarbeitung von HTTP-Anfragen
 from django.utils import timezone # Import für die Verarbeitung von Zeitstempeln
-
 
 def lege_konto_an(benutzername: str, passwort: str, rolle: str) -> tuple[Benutzerkonto | None, list[str]]:
     """
@@ -123,5 +122,13 @@ def melde_an(anfrage: HttpRequest, benutzername: str, passwort: str) -> list[str
         Fehlerliste.append("Anmeldung fehlgeschlagen")
         return Fehlerliste
 
-    # Anmeldung erfolgreich; Sitzungsaufbau ausstehend
-    return []
+    # Nach richtigem Passwort Fehlversuchs- und Sperrzustand zurücksetzen
+    konto.fehlversuche = 0
+    konto.fehlversuchszeitraum_beginn = None
+    konto.gesperrt_bis = None
+    konto.save()  # Zurückgesetzte Werte in der Datenbank speichern
+
+    # Das geprüfte Benutzerkonto mit der Sitzung der Anfrage verknüpfen
+    login(anfrage, konto)
+
+    return []  # Leere Fehlerliste nach dem Sitzungsaufbau zurückgeben
