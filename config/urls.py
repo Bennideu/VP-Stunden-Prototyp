@@ -17,6 +17,15 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
+from vp_stunden.views import melde_an_view, melde_ab_view, aendere_passwort_view
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+
+    # Anfragen an anmelden/ an die Anmelde-View weiterleiten
+    path('anmelden/', melde_an_view, name='melde_an'),
+    # Anfragen an abmelden/ an die Abmelde-View weiterleiten
+    path('abmelden/', melde_ab_view, name='melde_ab'),
+    # Anfragen an passwort_aendern/ an die Passwortänderungs-View weiterleiten
+    path('passwort_aendern/', aendere_passwort_view, name='aendere_passwort'),
 ]

@@ -128,3 +128,5 @@ AUTH_USER_MODEL = 'vp_stunden.Benutzerkonto'
 ANMELDE_MAX_FEHLVERSUCHE = 5  # Maximale Anzahl der fehlgeschlagenen Anmeldeversuche
 ANMELDE_FENSTER_SEKUNDEN = 15 * 60  # Zeitfenster in Sekunden (15 Minuten)
 ANMELDE_SPERRDAUER_SEKUNDEN = 5 * 60  # Sperrdauer in Sekunden (5 Minuten)
+SITZUNG_INAKTIVITAET_SEKUNDEN = 30 * 60
+SITZUNG_MAX_DAUER_SEKUNDEN = 4 * 60 * 60
