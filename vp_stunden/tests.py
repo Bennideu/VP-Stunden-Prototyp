@@ -7,19 +7,20 @@ from django.core.exceptions import ValidationError  # Ausnahme bei verletzten Va
 from django.http import HttpRequest  # HTTP-Anfrageobjekte für direkte Funktionstests erzeugen
 from django.test import SimpleTestCase  # Django-Testklasse ohne Datenbankzugriff
 from django.utils import timezone  # Zeitzonenbewusste Zeitpunkte und Zeitabstände verwenden
-from vp_stunden.models import Benutzerkonto  # Das benutzerdefinierte Kontenmodell verwenden
+from vp_stunden.models import Benutzerkonto, Untersuchung, Teilnahme  # Die benutzerdefinierten Modelle verwenden
 from django.contrib.auth.hashers import get_hasher  # Den konfigurierten Passwort-Hasher abrufen
 from django.test import TestCase  # Django-Testklasse für Tests mit Datenbankzugriff
 from django.contrib.auth import get_user  # Konto anhand der Sitzungsdaten ermitteln
 from vp_stunden.sicherheit import lege_konto_an, melde_an, melde_ab, pruefe_zugriff, setze_passwort_zurueck, aendere_passwort  # Zu prüfende Funktionen für Kontenanlage, Anmeldung, Abmeldung und Zugriffskontrolle
 from django.contrib.sessions.backends.db import SessionStore
 from django.contrib.auth import SESSION_KEY, get_user
+from django.db import IntegrityError, transaction  # Datenbankfehler erwarten und den Fehlversuch zurückrollen
+from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson  # Die Einordnungsvalidierung für Untersuchungen prüfen
 
 from vp_stunden.views import melde_an_view
 
 # Passwortlängen und erlaubte Zeichenfolgen nach QA-01 prüfen
 class PasswortregelnTests(SimpleTestCase):
-
 
     # 14 Zeichen unterschreiten die Mindestlänge und müssen abgewiesen werden
     def test_qa01_14_zeichen_werden_abgewiesen(self):
@@ -1581,3 +1582,530 @@ class PasswortAenderungViewTests(TestCase):
 
         # Die JSON-Antwort darf keinen Erfolg melden
         self.assertFalse(antwort.json()['erfolg'])
+
+
+class KontoErstellungViewTests(TestCase):
+
+    def test_fa02_administrator_kann_konto_anlegen(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.LEHRPERSON
+
+        # Ein Administrator-Konto anlegen und sich anmelden
+        admin_konto, fehlerliste = lege_konto_an('admin', 'adminpasswort12', Benutzerkonto.ADMINISTRATOR)
+        self.assertIsNotNone(admin_konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Die Anmeldung über die Anmelde-View durchführen
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': 'admin',
+                'passwort': 'adminpasswort12'
+            }
+        )
+
+        # Prüfen, dass die Anmeldung erfolgreich war
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        #Prüfen, dass der neue Benutzername noch nicht existiert
+        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
+
+        # Die Kontoerstellung mit allen erforderlichen Formularfeldern anfragen
+        antwort = self.client.post(
+            '/konto_anlegen/',
+            data={
+                'benutzername': benutzername,
+                'passwort': passwort,
+                'rolle': rolle
+            }
+        )
+
+        # Prüfen, dass die Kontoerstellung erfolgreich war
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort einen Erfolg meldet
+
+        # Das angelegte Konto erneut aus der Datenbank laden
+        neues_konto = Benutzerkonto.objects.get(username=benutzername)
+
+        # Die gespeicherten Kontodaten prüfen
+        self.assertEqual(neues_konto.username, benutzername)
+        self.assertEqual(neues_konto.rolle, rolle)
+        self.assertTrue(neues_konto.check_password(passwort))
+
+
+    def test_qa04_lehrperson_kann_kein_konto_anlegen(self):
+        # Synthetische Testwerte vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.ADMINISTRATOR
+
+        # Ein Lehrperson-Konto anlegen und sich anmelden
+        lehrperson_konto, fehlerliste = lege_konto_an('lehrperson', 'lehrpersonpasswort12', Benutzerkonto.LEHRPERSON)
+        self.assertIsNotNone(lehrperson_konto)
+        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+
+        # Die Anmeldung über die Anmelde-View durchführen
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': 'lehrperson',
+                'passwort': 'lehrpersonpasswort12'
+            }
+        )
+
+        # Prüfen, dass die Anmeldung erfolgreich war
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        # Prüfen, dass der neue Benutzername noch nicht existiert
+        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
+
+        # Die aktuelle Anzahl der Benutzerkonten vor der Kontoerstellung festhalten
+        kontozahl_vorher = Benutzerkonto.objects.count()
+
+        # Die Kontoerstellung mit allen erforderlichen Formularfeldern anfragen
+        antwort = self.client.post(
+            '/konto_anlegen/',
+            data={
+                'benutzername': benutzername,
+                'passwort': passwort,
+                'rolle': rolle
+            }
+        )
+
+        # Die Kontenanlage durch eine Lehrperson verweigern
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Es darf kein neues Konto angelegt worden sein
+        self.assertFalse(
+            Benutzerkonto.objects.filter(username=benutzername).exists()
+        )
+        self.assertEqual(
+            Benutzerkonto.objects.count(), kontozahl_vorher
+        )
+
+
+    def test_qa04_kontoanlage_ohne_anmeldung_wird_abgewiesen(self):
+        # Gültige synthetische Daten für das angefragte Konto vorbereiten
+        benutzername = 'testnutzer'
+        passwort = 'a' * 64
+        rolle = Benutzerkonto.ADMINISTRATOR
+
+        # Prüfen, dass der angefragte Benutzername noch nicht existiert
+        self.assertFalse(
+            Benutzerkonto.objects.filter(username=benutzername).exists()
+        )
+
+        # Die aktuelle Kontenzahl zum späteren Vergleich festhalten
+        kontozahl_vorher = Benutzerkonto.objects.count()
+
+        # Ohne vorherige Anmeldung eine vollständige Kontenanlage anfragen
+        antwort = self.client.post(
+            '/konto_anlegen/',
+            data={
+                'benutzername': benutzername,
+                'passwort': passwort,
+                'rolle': rolle
+            }
+        )
+
+        # Den Zugriff wegen der fehlenden Anmeldung verweigern
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Der angefragte Benutzername darf weiterhin nicht existieren
+        self.assertFalse(
+            Benutzerkonto.objects.filter(username=benutzername).exists()
+        )
+
+        # Die Kontenzahl muss unverändert bleiben
+        self.assertEqual(
+            Benutzerkonto.objects.count(), kontozahl_vorher
+        )
+
+    def test_fa02_get_anfrage_wird_abgewiesen(self):
+        # Eine GET-Anfrage über die URL-Zuordnung an die View senden
+        antwort = self.client.get('/konto_anlegen/')
+
+        # Die nicht erlaubte HTTP-Methode muss abgewiesen werden
+        self.assertEqual(antwort.status_code, 405)
+
+        # POST muss als erlaubte Methode angegeben werden
+        self.assertEqual(antwort['Allow'], 'POST')
+
+        # Die JSON-Antwort darf keinen Erfolg melden
+        self.assertFalse(antwort.json()['erfolg'])
+
+
+class PasswortZuruecksetzenViewTests(TestCase):
+
+    def test_fa02_administrator_kann_passwort_zuruecksetzen(self):
+        # Ein Administratorkonto vorbereiten
+        admin_benutzername = 'testadmin'
+        admin_passwort = 'a' * 64
+        admin_konto, fehlerliste = lege_konto_an(
+            admin_benutzername, admin_passwort, Benutzerkonto.ADMINISTRATOR
+        )
+        self.assertIsNotNone(admin_konto)
+        self.assertFalse(fehlerliste)
+
+        # Ein separates Lehrpersonenkonto als Ziel vorbereiten
+        passwort = 'b' * 64
+        neues_passwort = 'c' * 64
+        konto, fehlerliste = lege_konto_an(
+            'testnutzer', passwort, Benutzerkonto.LEHRPERSON
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+
+        # Mit dem Administratorkonto anmelden
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': admin_benutzername,
+                'passwort': admin_passwort
+            }
+        )
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        # Das Passwort des Zielkontos über dessen tatsächliche ID zurücksetzen
+        antwort = self.client.post(
+            '/passwort_zuruecksetzen/',
+            data={
+                'konto_id': str(konto.pk),
+                'neues_passwort': neues_passwort
+            }
+        )
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()['erfolg'])
+
+        # Den gespeicherten Zustand des Zielkontos prüfen
+        konto.refresh_from_db()
+        self.assertTrue(konto.check_password(neues_passwort))
+        self.assertFalse(konto.check_password(passwort))
+
+    def test_qa04_lehrperson_kann_kein_passwort_zuruecksetzen(self):
+        # Ein Lehrpersonenkonto für die Anmeldung vorbereiten
+        benutzername = 'testlehrperson'
+        passwort = 'a' * 64
+        lehrperson_konto, fehlerliste = lege_konto_an(
+            benutzername, passwort, Benutzerkonto.LEHRPERSON
+        )
+        self.assertIsNotNone(lehrperson_konto)
+        self.assertFalse(fehlerliste)
+
+        # Ein Administratorkonto als Ziel der unberechtigten Anfrage vorbereiten
+        zielpasswort = 'b' * 64
+        neues_passwort = 'c' * 64
+        konto, fehlerliste = lege_konto_an(
+            'testadmin', zielpasswort, Benutzerkonto.ADMINISTRATOR
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+        passwort_hash_vorher = konto.password
+
+        # Mit dem Lehrpersonenkonto regulär anmelden
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': benutzername,
+                'passwort': passwort
+            }
+        )
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        # Die Rücksetzung für das fremde Administratorkonto versuchen
+        antwort = self.client.post(
+            '/passwort_zuruecksetzen/',
+            data={
+                'konto_id': str(konto.pk),
+                'neues_passwort': neues_passwort
+            }
+        )
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Das Zielkonto muss unverändert bleiben
+        konto.refresh_from_db()
+        self.assertEqual(konto.password, passwort_hash_vorher)
+        self.assertTrue(konto.check_password(zielpasswort))
+        self.assertFalse(konto.check_password(neues_passwort))
+
+    def test_qa04_ruecksetzung_ohne_anmeldung_wird_abgewiesen(self):
+        # Ein Zielkonto vorbereiten, ohne sich anzumelden
+        passwort = 'a' * 64
+        neues_passwort = 'b' * 64
+        konto, fehlerliste = lege_konto_an(
+            'testnutzer', passwort, Benutzerkonto.LEHRPERSON
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+        passwort_hash_vorher = konto.password
+
+        # Ohne Anmeldung eine vollständige Rücksetzungsanfrage senden
+        antwort = self.client.post(
+            '/passwort_zuruecksetzen/',
+            data={
+                'konto_id': str(konto.pk),
+                'neues_passwort': neues_passwort
+            }
+        )
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Die abgewiesene Anfrage darf das Passwort nicht verändern
+        konto.refresh_from_db()
+        self.assertEqual(konto.password, passwort_hash_vorher)
+        self.assertTrue(konto.check_password(passwort))
+        self.assertFalse(konto.check_password(neues_passwort))
+
+    def test_fa02_get_anfrage_wird_abgewiesen(self):
+        # Eine GET-Anfrage an die Rücksetzungs-View senden
+        antwort = self.client.get('/passwort_zuruecksetzen/')
+
+        # Die View darf ausschließlich POST zulassen
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort['Allow'], 'POST')
+        self.assertFalse(antwort.json()['erfolg'])
+
+    def test_fa02_ungueltige_konto_id_wird_abgewiesen(self):
+        # Ein Administratorkonto vorbereiten
+        benutzername = 'testadmin'
+        passwort = 'a' * 64
+        admin_konto, fehlerliste = lege_konto_an(
+            benutzername, passwort, Benutzerkonto.ADMINISTRATOR
+        )
+        self.assertIsNotNone(admin_konto)
+        self.assertFalse(fehlerliste)
+
+        # Mit dem Administratorkonto regulär anmelden
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': benutzername,
+                'passwort': passwort
+            }
+        )
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        # Die Rücksetzfunktion durch ein Testobjekt ersetzen, das Aufrufe erfasst
+        with patch('vp_stunden.views.setze_passwort_zurueck') as ruecksetzfunktion:
+            # Eine Konto-ID senden, die keine Ganzzahl darstellt
+            antwort = self.client.post(
+                '/passwort_zuruecksetzen/',
+                data={
+                    'konto_id': 'keine_zahl',
+                    'neues_passwort': 'b' * 64
+                }
+            )
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Die ungültige ID muss bereits in der View abgefangen werden
+        ruecksetzfunktion.assert_not_called()
+
+    def test_qa01_zu_kurzes_passwort_verhindert_ruecksetzung(self):
+        # Ein Administratorkonto vorbereiten
+        admin_benutzername = 'testadmin'
+        admin_passwort = 'a' * 64
+        admin_konto, fehlerliste = lege_konto_an(
+            admin_benutzername, admin_passwort, Benutzerkonto.ADMINISTRATOR
+        )
+        self.assertIsNotNone(admin_konto)
+        self.assertFalse(fehlerliste)
+
+        # Ein Zielkonto mit gültigem bisherigem Passwort vorbereiten
+        passwort = 'b' * 64
+        neues_passwort = 'c' * 14
+        konto, fehlerliste = lege_konto_an(
+            'testnutzer', passwort, Benutzerkonto.LEHRPERSON
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+        passwort_hash_vorher = konto.password
+
+        # Mit dem Administratorkonto regulär anmelden
+        antwort_anmeldung = self.client.post(
+            '/anmelden/',
+            data={
+                'benutzername': admin_benutzername,
+                'passwort': admin_passwort
+            }
+        )
+        self.assertEqual(antwort_anmeldung.status_code, 200)
+        self.assertTrue(antwort_anmeldung.json()['erfolg'])
+
+        # Die Rücksetzung mit einem Passwort unterhalb der Mindestlänge versuchen
+        antwort = self.client.post(
+            '/passwort_zuruecksetzen/',
+            data={
+                'konto_id': str(konto.pk),
+                'neues_passwort': neues_passwort
+            }
+        )
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()['erfolg'])
+
+        # Der gespeicherte Hash und das bisherige Passwort müssen erhalten bleiben
+        konto.refresh_from_db()
+        self.assertEqual(konto.password, passwort_hash_vorher)
+        self.assertTrue(konto.check_password(passwort))
+        self.assertFalse(konto.check_password(neues_passwort))
+
+
+class VPDatenmodellTests(TestCase):
+
+    def test_fa08_vergleichswert_ist_eindeutig(self):
+        # Zwei verschiedene Untersuchungen mit demselben Vergleichswert anlegen
+        anzeigename1 = 'Teststudie A'
+        vergleichswert1 = 'teststudie a'
+
+        # Die erste Untersuchung erfolgreich anlegen
+        studie1 = Untersuchung.objects.create(
+            studienname=anzeigename1,
+            studienname_vergleich=vergleichswert1,
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson='testdozentA'
+        )
+
+        anzeigename2 = 'TESTSTUDIE A '
+        vergleichswert2 = 'teststudie a'  # Derselbe Vergleichswert wie bei studieA
+
+        # Der Versuch, eine zweite Untersuchung mit demselben Vergleichswert anzulegen, muss eine Integritätsverletzung auslösen
+        # Den fehlgeschlagenen Schreibversuch zuerst zum Sicherungspunkt zurückrollen
+        # und danach den erwarteten Integritätsfehler abfangen, damit anschließende
+        # Datenbankabfragen im Test möglich bleiben.
+        with self.assertRaises(IntegrityError): # Die Integritätsverletzung wird erwartet, da der Vergleichswert eindeutig sein muss
+            with transaction.atomic(): #
+                Untersuchung.objects.create(
+                    studienname=anzeigename2,
+                    studienname_vergleich=vergleichswert2,
+                    stundenwert=1.5,
+                    einordnung=Untersuchung.PRAESENZ,
+                    lehrperson='testdozentB',
+                )
+
+        # Prüfen, dass nur die erste Untersuchung erfolgreich in der Datenbank gespeichert wurde
+        self.assertEqual(Untersuchung.objects.count(), 1)
+
+
+    def test_fa12_teilnahmezuordnung_ist_eindeutig(self):
+        # Erste Untersuchung anlegen
+        studie1 = Untersuchung.objects.create(
+            studienname='Studie 1',
+            studienname_vergleich='studie 1',
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson='dozent1',
+        )
+
+        # Zweite Untersuchung anlegen
+        studie2 = Untersuchung.objects.create(
+            studienname='Studie 2',
+            studienname_vergleich='studie 2',
+            stundenwert=2.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson='dozent2',
+        )
+
+        #Teilnahmezuordnungen anlegen
+        teilnahme1 = Teilnahme.objects.create(
+            untersuchung=studie1,
+            matrikelnummer='1234567',
+        )
+
+        teilnahme2 = Teilnahme.objects.create(
+            untersuchung=studie2,
+            matrikelnummer='1234567',
+        )
+
+        teilnahme3 = Teilnahme.objects.create(
+            untersuchung=studie1,
+            matrikelnummer='7654321',
+        )
+
+        # Erste Zuordnung erneut anlegen, was eine Integritätsverletzung auslösen muss
+        # Den fehlgeschlagenen Schreibversuch zuerst zum Sicherungspunkt zurückrollen
+        # und danach den erwarteten Integritätsfehler abfangen, damit anschließende
+        # Datenbankabfragen im Test möglich bleiben.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Teilnahme.objects.create(
+                    untersuchung=studie1,
+                    matrikelnummer='1234567',
+                )
+
+        # Prüfen, dass nur die drei eindeutigen Zuordnungen in der Datenbank gespeichert wurden
+        self.assertEqual(Teilnahme.objects.count(), 3)
+
+# SimpleTestCase wird verwendet, da keine Datenbankzugriffe in den EinordnungTests durchgeführt werden
+class EinordnungTests(SimpleTestCase):
+
+    def test_fa07_gueltige_einordnung_bleibt_unveraendert(self):
+        # Der Aufruf mit 'P' muss 'P' zurückgeben
+        self.assertEqual(pruefe_einordnung('P'), 'P')
+
+        # Der Aufruf mit 'O' muss 'O' zurückgeben
+        self.assertEqual(pruefe_einordnung('O'), 'O')
+
+    def test_fa07_ungueltige_einordnung_wird_abgewiesen(self):
+        for ungueltige_einordnung in ['p', 'o', ' P ', 'P ', '', 'X', None, 1, True]:
+            with self.subTest(wert=ungueltige_einordnung):
+                with self.assertRaises(ValidationError):
+                    pruefe_einordnung(ungueltige_einordnung)
+
+
+class MatrikelnummerTests(SimpleTestCase):
+
+    def test_fa07_gueltige_matrikelnummer_wird_als_text_zurueckgegeben(self):
+        # Der Aufruf mit einer gültigen Matrikelnummer muss die Matrikelnummer als Text zurückgeben
+        self.assertEqual(pruefe_matrikelnummer(1000000), '1000000')
+        self.assertEqual(pruefe_matrikelnummer(1234567), '1234567')
+        self.assertEqual(pruefe_matrikelnummer(9999999), '9999999')
+
+    def test_fa07_ungueltige_matrikelnummer_wird_abgewiesen(self):
+        for ungueltige_matrikelnummer in [999_999, 10_000_000, 0, -1234567, '1234567', 1234567.0, 1234567.5, None, True, False]:
+            with self.subTest(wert=ungueltige_matrikelnummer):
+                with self.assertRaises(ValidationError):
+                    pruefe_matrikelnummer(ungueltige_matrikelnummer)
+
+
+class LehrpersonTests(SimpleTestCase):
+
+    def test_fa07_gueltiger_lehrpersonenname_wird_bereinigt(self):
+        # Äußere Leerzeichen entfernen.
+        self.assertEqual(
+            pruefe_lehrperson('  Dr. Müller  '),
+            'Dr. Müller'
+        )
+
+        # Innere Leerzeichen unverändert erhalten.
+        self.assertEqual(
+            pruefe_lehrperson('Herr  Müller'),
+            'Herr  Müller'
+        )
+
+        # Ein einzelnes Zeichen erfüllt die Mindestlänge.
+        self.assertEqual(pruefe_lehrperson('A'), 'A')
+
+        # Genau 100 Zeichen nach Entfernung äußerer Leerzeichen zulassen.
+        self.assertEqual(
+            pruefe_lehrperson('  ' + 'A' * 100 + '  '),
+            'A' * 100
+        )
+
+    def test_fa07_ungueltiger_lehrpersonenname_wird_abgewiesen(self):
+        # Leere Texte, überlange Namen und falsche Datentypen abweisen.
+        for ungueltiger_name in ['', '   ', 'A' * 101, None, 123, True]:
+            with self.subTest(wert=ungueltiger_name):
+                with self.assertRaises(ValidationError):
+                    pruefe_lehrperson(ungueltiger_name)

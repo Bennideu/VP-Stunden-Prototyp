@@ -17,7 +17,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
-from vp_stunden.views import melde_an_view, melde_ab_view, aendere_passwort_view
+from vp_stunden.views import melde_an_view, melde_ab_view, aendere_passwort_view, lege_konto_an_view, setze_passwort_zurueck_view
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -28,4 +28,8 @@ urlpatterns = [
     path('abmelden/', melde_ab_view, name='melde_ab'),
     # Anfragen an passwort_aendern/ an die Passwortänderungs-View weiterleiten
     path('passwort_aendern/', aendere_passwort_view, name='aendere_passwort'),
+    # Anfragen an konto_anlegen/ an die Kontoerstellungs-View weiterleiten
+    path('konto_anlegen/', lege_konto_an_view, name='lege_konto_an'),
+    # Anfragen an passwort_zuruecksetzen/ an die Passwort-Zurücksetzungs-View weiterleiten
+    path('passwort_zuruecksetzen/', setze_passwort_zurueck_view, name='setze_passwort_zurueck'),
 ]
