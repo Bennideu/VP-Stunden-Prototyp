@@ -15,7 +15,7 @@ from vp_stunden.sicherheit import lege_konto_an, melde_an, melde_ab, pruefe_zugr
 from django.contrib.sessions.backends.db import SessionStore
 from django.contrib.auth import SESSION_KEY, get_user
 from django.db import IntegrityError, transaction  # Datenbankfehler erwarten und den Fehlversuch zurückrollen
-from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson  # Die Einordnungsvalidierung für Untersuchungen prüfen
+from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson, pruefe_studienname, pruefe_stundenwert, berechne_stunden, suche_teilnahmen, suche_untersuchungen  # Die Einordnungsvalidierung für Untersuchungen prüfen
 
 from vp_stunden.views import melde_an_view
 
@@ -2109,3 +2109,325 @@ class LehrpersonTests(SimpleTestCase):
             with self.subTest(wert=ungueltiger_name):
                 with self.assertRaises(ValidationError):
                     pruefe_lehrperson(ungueltiger_name)
+
+
+class StudiennameTests(SimpleTestCase):
+
+    def test_fa07_gueltiger_studienname_liefert_anzeigename_und_vergleichswert(self):
+        # Äußere Leerzeichen entfernen und beide Werte zurückgeben.
+        self.assertEqual(
+            pruefe_studienname('  Teststudie A  '),
+            ('Teststudie A', 'teststudie a')
+        )
+
+        # Andere Großschreibung ergibt denselben Vergleichswert.
+        # Die Schreibweise des Anzeigenamens bleibt erhalten.
+        self.assertEqual(
+            pruefe_studienname('TESTSTUDIE A'),
+            ('TESTSTUDIE A', 'teststudie a')
+        )
+
+        # Innere Leerzeichen in beiden Werten erhalten.
+        self.assertEqual(
+            pruefe_studienname('Test  Studie'),
+            ('Test  Studie', 'test  studie')
+        )
+
+        # Ein einzelnes Zeichen erfüllt die Mindestlänge.
+        self.assertEqual(
+            pruefe_studienname('A'),
+            ('A', 'a')
+        )
+
+        # Genau 100 Zeichen nach der Bereinigung zulassen.
+        # Der Vergleichswert darf durch casefold länger werden: ß wird zu ss.
+        self.assertEqual(
+            pruefe_studienname('  ' + 'ß' * 100 + '  '),
+            ('ß' * 100, 'ss' * 100)
+        )
+
+    def test_fa07_ungueltiger_studienname_wird_abgewiesen(self):
+        # Leere Texte, überlange Namen und falsche Datentypen abweisen.
+        for ungueltiger_name in ['', '   ', 'A' * 101, None, 123, True]:
+            with self.subTest(wert=ungueltiger_name):
+                with self.assertRaises(ValidationError):
+                    pruefe_studienname(ungueltiger_name)
+
+
+class StundenwertTests(SimpleTestCase):
+
+    def test_fa07_gueltiger_stundenwert_wird_als_float_zurueckgegeben(self):
+        # Jeweils Eingabewert und erwarteten Rückgabewert festlegen.
+        testfaelle = [
+            (0.5, 0.5),
+            (1, 1.0),
+            (1.5, 1.5),
+            (2.0, 2.0),
+            (1000, 1000.0),
+        ]
+
+        for eingabe, erwartet in testfaelle:
+            # subTest verwenden, um jeden Testfall separat zu prüfen und die Fehlermeldung zu isolieren.
+            with self.subTest(wert=eingabe):
+                ergebnis = pruefe_stundenwert(eingabe)
+
+                # Den Zahlenwert und den Rückgabetyp prüfen.
+                self.assertEqual(ergebnis, erwartet)
+                self.assertIsInstance(ergebnis, float)
+
+    def test_fa07_ungueltiger_stundenwert_wird_abgewiesen(self):
+        # Null, negative Werte, falsche Schritte und Datentypen abweisen.
+        for ungueltiger_wert in [
+            0, -0.5, 0.25, 1.25, '1.5', '', None, True, False
+        ]:
+            # subTest verwenden, um jeden ungültigen Wert separat zu prüfen und die Fehlermeldung zu isolieren.
+            with self.subTest(wert=ungueltiger_wert):
+                with self.assertRaises(ValidationError):
+                    pruefe_stundenwert(ungueltiger_wert)
+
+
+class StundenberechnungTests(SimpleTestCase):
+
+    def test_fa16_leere_liste_liefert_nullsummen(self):
+        ergebnis = berechne_stunden([])
+
+        self.assertEqual(ergebnis, {
+            "praesenzstunden": 0.0,
+            "onlinestunden": 0.0,
+            "gesamtstunden": 0.0,
+            "erfuellt": False,
+        })
+
+        # Auch bei leerer Liste müssen die Summen Fließkommazahlen sein.
+        for feldname in ["praesenzstunden", "onlinestunden", "gesamtstunden"]:
+            self.assertIsInstance(ergebnis[feldname], float)
+
+    def test_fa16_stunden_werden_nach_einordnung_addiert(self):
+        # Mehrere Teilnahmen je Einordnung prüfen das Aufsummieren.
+        testfaelle = [
+            (Untersuchung.PRAESENZ, 1.5),
+            (Untersuchung.PRAESENZ, 2.5),
+            (Untersuchung.ONLINE, 0.5),
+            (Untersuchung.ONLINE, 1.0),
+        ]
+
+        teilnahmen = []
+
+        for einordnung, stundenwert in testfaelle:
+            # Die Modellobjekte bleiben ausschließlich im Arbeitsspeicher.
+            untersuchung = Untersuchung(
+                einordnung=einordnung,
+                stundenwert=stundenwert,
+            )
+            teilnahmen.append(Teilnahme(untersuchung=untersuchung))
+
+        ergebnis = berechne_stunden(teilnahmen)
+
+        self.assertEqual(ergebnis, {
+            "praesenzstunden": 4.0,
+            "onlinestunden": 1.5,
+            "gesamtstunden": 5.5,
+            "erfuellt": False,
+        })
+
+    def test_fa16_erfuellungsgrenzen_werden_beachtet(self):
+        # Präsenzstunden, Onlinestunden, erwartete Gesamtstunden und Status.
+        testfaelle = [
+            (15.0, 15.0, 30.0, True),    # Beide Mindestwerte genau erreicht.
+            (15.0, 14.5, 29.5, False),   # Zu wenige Gesamtstunden.
+            (14.5, 15.5, 30.0, False),   # Zu wenige Präsenzstunden.
+            (30.0, 0.0, 30.0, True),     # Onlinestunden sind nicht erforderlich.
+        ]
+
+        for praesenzstunden, onlinestunden, gesamtstunden, erfuellt in testfaelle:
+            # subTest verwenden, um jeden Testfall separat zu prüfen und die Fehlermeldung zu isolieren.
+            with self.subTest(
+                praesenzstunden=praesenzstunden,
+                onlinestunden=onlinestunden,
+            ):
+                # Untersuchungen anlegen, die ausschließlich im Arbeitsspeicher existieren.
+                praesenzuntersuchung = Untersuchung(
+                    einordnung=Untersuchung.PRAESENZ,
+                    stundenwert=praesenzstunden,
+                )
+
+                # Die Präsenz-Teilnahme wird der Liste hinzugefügt.
+                teilnahmen = [
+                    Teilnahme(untersuchung=praesenzuntersuchung),
+                ]
+
+                # Bei null Onlinestunden gibt es keine Online-Teilnahme.
+                if onlinestunden > 0:
+                    onlineuntersuchung = Untersuchung(
+                        einordnung=Untersuchung.ONLINE,
+                        stundenwert=onlinestunden,
+                    )
+                    # Die Online-Teilnahme wird der Liste hinzugefügt.
+                    teilnahmen.append(
+                        Teilnahme(untersuchung=onlineuntersuchung)
+                    )
+
+                # Die Stundenberechnung durchführen.
+                ergebnis = berechne_stunden(teilnahmen)
+
+                # Die erwarteten Summen und den Status prüfen.
+                self.assertEqual(ergebnis, {
+                    "praesenzstunden": praesenzstunden,
+                    "onlinestunden": onlinestunden,
+                    "gesamtstunden": gesamtstunden,
+                    "erfuellt": erfuellt,
+                })
+
+                # Der Status muss tatsächlich True beziehungsweise False sein.
+                self.assertIs(ergebnis["erfuellt"], erfuellt)
+
+
+class TeilnahmesucheTests(TestCase):
+
+    def setUp(self):
+        # Untersuchungen bewusst entgegen der erwarteten Sortierung anlegen.
+        untersuchung_beta = Untersuchung.objects.create(
+            studienname="Beta",
+            studienname_vergleich="beta",
+            stundenwert=1.5,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Testlehrperson Beta",
+        )
+
+        untersuchung_alpha = Untersuchung.objects.create(
+            studienname="alpha",
+            studienname_vergleich="alpha",
+            stundenwert=2.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alpha",
+        )
+
+        # Zwei Teilnahmen der gesuchten Matrikelnummer speichern.
+        self.teilnahme_beta = Teilnahme.objects.create(
+            untersuchung=untersuchung_beta,
+            matrikelnummer="1234567",
+        )
+
+        self.teilnahme_alpha = Teilnahme.objects.create(
+            untersuchung=untersuchung_alpha,
+            matrikelnummer="1234567",
+        )
+
+        # Diese Teilnahme darf bei der Suche nicht erscheinen.
+        Teilnahme.objects.create(
+            untersuchung=untersuchung_beta,
+            matrikelnummer="7654321",
+        )
+
+    def test_fa14_passende_teilnahmen_werden_sortiert_geladen(self):
+        teilnahmen = suche_teilnahmen("1234567")
+
+        # Eine Liste mit ausschließlich den passenden Teilnahmen erwarten.
+        # Die Reihenfolge richtet sich nach dem Studiennamenvergleich.
+        self.assertIsInstance(teilnahmen, list)
+        self.assertEqual(
+            teilnahmen,
+            [self.teilnahme_alpha, self.teilnahme_beta],
+        )
+
+        # Die Untersuchungen müssen bereits vollständig mitgeladen sein.
+        # Ihre Angaben erstmals innerhalb dieses Prüfblocks lesen.
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                teilnahmen[0].untersuchung.studienname,
+                "alpha",
+            )
+            self.assertEqual(
+                teilnahmen[0].untersuchung.lehrperson,
+                "Testlehrperson Alpha",
+            )
+            self.assertEqual(
+                teilnahmen[1].untersuchung.studienname,
+                "Beta",
+            )
+            self.assertEqual(
+                teilnahmen[1].untersuchung.lehrperson,
+                "Testlehrperson Beta",
+            )
+
+            berechnung = berechne_stunden(teilnahmen)
+
+        # Die Berechnung verwendet Stundenwerte und Einordnungen
+        # der mitgeladenen Untersuchungen.
+        self.assertEqual(berechnung, {
+            "praesenzstunden": 2.5,
+            "onlinestunden": 1.5,
+            "gesamtstunden": 4.0,
+            "erfuellt": False,
+        })
+
+    def test_fa14_fehlende_matrikelnummer_liefert_leere_liste(self):
+        # Trotz vorhandener anderer Teilnahmen gibt es keinen Treffer.
+        ergebnis = suche_teilnahmen("9999999")
+
+        self.assertEqual(ergebnis, [])
+
+
+class UntersuchungssucheTests(TestCase):
+
+    def setUp(self):
+        # Untersuchungen bewusst entgegen der erwarteten Sortierung anlegen.
+        self.untersuchung_beta = Untersuchung.objects.create(
+            studienname="Beta Studie",
+            studienname_vergleich="beta studie",
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson",
+        )
+
+        self.untersuchung_alpha = Untersuchung.objects.create(
+            studienname="alpha Studie",
+            studienname_vergleich="alpha studie",
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson",
+        )
+
+        # Umlaute und ß prüfen die Unicode-Vergleichsregel.
+        self.untersuchung_gedaechtnis = Untersuchung.objects.create(
+            studienname="Gedächtnisstraße",
+            studienname_vergleich="gedächtnisstrasse",
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson",
+        )
+
+    def test_fa14_vollname_und_namensteil_liefern_sortierte_treffer(self):
+        # Jeweils Suchtext und ausdrücklich erwartete Ergebnisliste festlegen.
+        testfaelle = [
+            ("alpha Studie", [self.untersuchung_alpha]),
+            ("ALPHA STUDIE", [self.untersuchung_alpha]),
+            ("StUdIe",[self.untersuchung_alpha, self.untersuchung_beta]),
+            ("Gedächtnisstraße", [self.untersuchung_gedaechtnis]),
+            ("GEDÄCHTNISSTRASSE", [self.untersuchung_gedaechtnis]),
+            ("DÄCHTNIS", [self.untersuchung_gedaechtnis]),
+        ]
+
+        for suchtext, erwartet in testfaelle:
+            with self.subTest(suchtext=suchtext):
+                ergebnis = suche_untersuchungen(suchtext)
+
+                # Rückgabetyp, passende Untersuchungen und Reihenfolge prüfen.
+                self.assertIsInstance(ergebnis, list)
+                self.assertEqual(ergebnis, erwartet)
+
+    def test_fa14_fehlender_studienname_liefert_leere_liste(self):
+        # Trotz vorhandener Untersuchungen gibt es keinen passenden Treffer.
+        ergebnis = suche_untersuchungen("Unbekannte Untersuchung")
+
+        self.assertEqual(ergebnis, [])
+
+    def test_leerer_suchtext_liefert_alle_untersuchungen(self):
+        # Das besprochene Verhalten bei leerem Suchtext festhalten.
+        ergebnis = suche_untersuchungen("")
+
+        self.assertEqual(ergebnis, [
+            self.untersuchung_alpha,
+            self.untersuchung_beta,
+            self.untersuchung_gedaechtnis,
+        ])
