@@ -17,6 +17,7 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
+import vp_stunden
 from vp_stunden.views import melde_an_view, melde_ab_view, aendere_passwort_view, lege_konto_an_view, setze_passwort_zurueck_view
 
 urlpatterns = [
@@ -32,4 +33,14 @@ urlpatterns = [
     path('konto_anlegen/', lege_konto_an_view, name='lege_konto_an'),
     # Anfragen an passwort_zuruecksetzen/ an die Passwort-Zurücksetzungs-View weiterleiten
     path('passwort_zuruecksetzen/', setze_passwort_zurueck_view, name='setze_passwort_zurueck'),
+    # Löschanfragen an die View für Teilnahmedaten weiterleiten
+    path ('teilnahmedaten_loeschen/', vp_stunden.views.loesche_teilnahmedaten_view, name='loesche_teilnahmedaten'),
+    # Suchanfragen nach Matrikelnummer an die Teilnahmesuche-View weiterleiten
+    path('teilnahmen_suchen/', vp_stunden.views.suche_teilnahmen_view, name='suche_teilnahmen'),
+    # Suchanfragen nach Studienname an die Untersuchungssuche-View weiterleiten
+    path('untersuchungen_suchen/', vp_stunden.views.suche_untersuchungen_view, name='suche_untersuchungen'),
+    # Administrative Untersuchungskorrekturen an die zuständige View weiterleiten.
+    path('untersuchung_korrigieren/', vp_stunden.views.korrigiere_untersuchung_view, name='korrigiere_untersuchung'),
+    # Administrative Reportanfragen an die PDF-Reportview weiterleiten.
+    path('report_erzeugen/', vp_stunden.views.erzeuge_report_view, name='erzeuge_report'),
 ]

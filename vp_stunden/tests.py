@@ -1,7 +1,8 @@
 # Anforderungsbezogene Tests für Passwörter, Benutzerkonten und Anmeldebegrenzung
 
-from unittest.mock import patch  # Funktionen während eines Tests gezielt ersetzen
-
+from unittest.mock import DEFAULT, patch  # Einzelne Speicheraufrufe gezielt beeinflussen
+from datetime import datetime # datetime wandelt Strings in Zeitpunkte um und erzeugt Zeitpunkte für die Tests
+from django.db import DatabaseError, IntegrityError, transaction # Datenbankfehler erwarten und den Fehlversuch zurückrollen
 from django.contrib.auth.password_validation import validate_password  # Die konfigurierten Django-Passwortregeln prüfen
 from django.core.exceptions import ValidationError  # Ausnahme bei verletzten Validierungsregeln
 from django.http import HttpRequest  # HTTP-Anfrageobjekte für direkte Funktionstests erzeugen
@@ -15,11 +16,16 @@ from vp_stunden.sicherheit import lege_konto_an, melde_an, melde_ab, pruefe_zugr
 from django.contrib.sessions.backends.db import SessionStore
 from django.contrib.auth import SESSION_KEY, get_user
 from django.db import IntegrityError, transaction  # Datenbankfehler erwarten und den Fehlversuch zurückrollen
-from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson, pruefe_studienname, pruefe_stundenwert, berechne_stunden, suche_teilnahmen, suche_untersuchungen  # Die Einordnungsvalidierung für Untersuchungen prüfen
-
+from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson, pruefe_studienname, pruefe_stundenwert, berechne_stunden, suche_teilnahmen, suche_untersuchungen, korrigiere_untersuchung, loesche_teilnahmedaten  # Die Einordnungsvalidierung für Untersuchungen prüfen
+from vp_stunden.reports import erzeuge_report  # Die Reportgenerierung prüfen
 from vp_stunden.views import melde_an_view
-
-# Passwortlängen und erlaubte Zeichenfolgen nach QA-01 prüfen
+from io import BytesIO  # XLSX-Dateien vollständig im Arbeitsspeicher erzeugen
+from django.core.files.uploadedfile import SimpleUploadedFile  # Einen Speicherupload bereitstellen
+from openpyxl import Workbook  # Eine Excel-Arbeitsmappe erzeugen
+from vp_stunden.importe import (
+    importiere_uebergangsdatei,
+    importiere_untersuchung,
+)# Passwortlängen und erlaubte Zeichenfolgen nach QA-01 prüfen
 class PasswortregelnTests(SimpleTestCase):
 
     # 14 Zeichen unterschreiten die Mindestlänge und müssen abgewiesen werden
@@ -2368,66 +2374,2173 @@ class TeilnahmesucheTests(TestCase):
         self.assertEqual(ergebnis, [])
 
 
-class UntersuchungssucheTests(TestCase):
+# TestCase unterstützt Tests mit Datenbankzugriff und stellt Prüfmethoden
+# wie assertEqual bereit. Der Testrunner verwendet eine eigene Testdatenbank.
+# TestCase setzt die Datenbankänderungen nach jedem einzelnen Test zurück.
+class UntersuchungskorrekturTests(TestCase):
 
     def setUp(self):
-        # Untersuchungen bewusst entgegen der erwarteten Sortierung anlegen.
-        self.untersuchung_beta = Untersuchung.objects.create(
-            studienname="Beta Studie",
-            studienname_vergleich="beta studie",
+        # setUp wird automatisch vor jeder Testmethode aufgerufen.
+        # Dadurch beginnen die Tests mit demselben vorbereiteten Bestand.
+        #
+        # self bezeichnet die aktuelle Testinstanz. Über self gespeicherte
+        # Objekte sind auch in deren anderen Methoden verfügbar.
+        #
+        # objects.create erzeugt ein Modellobjekt, speichert es sofort
+        # in der Testdatenbank und gibt das gespeicherte Objekt zurück.
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Ausgangsstudie",
+            studienname_vergleich="ausgangsstudie",
             stundenwert=1.0,
             einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Alte Lehrperson",
+        )
+
+        # Eine zweite Untersuchung ermöglicht die Prüfung von Namenskonflikten.
+        # Außerdem wird geprüft, dass die Korrektur keine zusätzlichen Untersuchungen anlegt.
+        self.andere_untersuchung = Untersuchung.objects.create(
+            studienname="Andere Studie",
+            studienname_vergleich="andere studie",
+            stundenwert=2.0,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Andere Lehrperson",
+        )
+
+        # Zwei verschiedene Matrikelnummern derselben Untersuchung zuordnen.
+        # Die Übergabe des Untersuchungsobjekts stellt die Fremdschlüsselverbindung zwischen Teilnahme und Untersuchung her.
+        for matrikelnummer in ["1234567", "7654321"]:
+            Teilnahme.objects.create(
+                untersuchung=self.untersuchung,
+                matrikelnummer=matrikelnummer,
+            )
+
+        # Den ursprünglichen Uploadzeitpunkt für einen späteren Vergleich merken.
+        self.uploadzeitpunkt = self.untersuchung.uploadzeitpunkt
+
+        # Den vollständigen Ausgangsbestand als Feldwerte festhalten:
+        # - order_by("pk") sortiert aufsteigend nach dem Primärschlüssel.
+        # - values() liefert je Datensatz ein Dictionary mit seinen Feldwerten.
+        # - list() führt die Abfrage sofort aus und hält den jetzigen Stand fest.
+        #
+        # Dadurch werden spätere Datenbankwerte mit einem bereits bereits gelesenen Ausgangsstand verglichen.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+        # Bei Teilnahmen enthalten die Feldwerte auch untersuchung_id.
+        # Der Vergleich erfasst damit IDs, Matrikelnummern und Zuordnungen.
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+    def test_fa15_gueltige_korrektur_wird_gespeichert(self):
+        ergebnis, fehlerliste = korrigiere_untersuchung(
+            untersuchung_id=self.untersuchung.pk,
+            studienname="  Neue Studie ",
+            stundenwert=2.5,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="  Neue Lehrperson  ",
+        )
+
+        # Die Korrektur muss erfolgreich sein und keine Fehler zurückgeben.
+        self.assertEqual(fehlerliste, [])
+
+        # Die Rückgabe muss ein Untersuchung-Objekt sein.
+        self.assertIsInstance(ergebnis, Untersuchung)
+
+        # Die Rückgabe muss dieselbe Untersuchung wie die Ausgangsuntersuchung sein.
+        self.assertEqual(ergebnis.pk, self.untersuchung.pk)
+
+        # Die Rückgabe muss die neuen Werte enthalten.
+        self.assertEqual(ergebnis.studienname, "Neue Studie")
+
+        # Die Korrekturfunktion hat eine eigene Instanz aus der Datenbank geladen.
+        # Das Objekt aus setUp enthält deshalb zunächst noch die alten Werte.
+        # refresh_from_db aktualisiert dieses Objekt mit den Datenbankwerten.
+        # So wird geprüft , was tatsächlich gespeichert wurde.
+        self.untersuchung.refresh_from_db()
+
+        # Anzeigenamen und zugehörigen Vergleichswert prüfen.
+        self.assertEqual(self.untersuchung.studienname, "Neue Studie")
+        self.assertEqual(
+            self.untersuchung.studienname_vergleich,
+            "neue studie",
+        )
+
+        # Gespeicherten Stundenwert, Einordnung und bereinigten Lehrnamen prüfen.
+        self.assertEqual(self.untersuchung.stundenwert, 2.5)
+        self.assertEqual(self.untersuchung.einordnung, Untersuchung.ONLINE)
+        self.assertEqual(self.untersuchung.lehrperson, "Neue Lehrperson")
+
+        # Der erstmalige Uploadzeitpunkt muss bei einer Korrektur erhalten bleiben.
+        self.assertEqual(
+            self.untersuchung.uploadzeitpunkt,
+            self.uploadzeitpunkt,
+        )
+
+        # Den aktuellen Teilnahmebestand mit dem Ausgangsbestand vergleichen.
+        # Alle bisherigen Teilnahmen müssen weiterhin unverändert auf dieselbe Untersuchung verweisen.
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+        # count() zählt die gespeicherten Untersuchungen.
+        # Eine Korrektur darf keine zusätzliche Untersuchung anlegen.
+        self.assertEqual(Untersuchung.objects.count(), 2)
+
+        # Im Ausgangsbestand wurde die andere Untersuchung als zweite angelegt und besitzt die größere ID. Sie muss unverändert bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values())[1],
+            self.untersuchungsbestand[1],
+        )
+
+    def test_fa15_eigener_studienname_bleibt_erlaubt(self):
+        # Der neue Anzeigename verwendet eine andere Großschreibung.
+        # Sein Vergleichswert bleibt jedoch "ausgangsstudie".
+        # Die bearbeitete Untersuchung muss beim Namensvergleich ausgeschlossen
+        # werden, damit ihr eigener Name keinen Konflikt auslöst.
+        ergebnis, fehlerliste = korrigiere_untersuchung(
+            untersuchung_id=self.untersuchung.pk,
+            studienname="  AUSGANGSSTUDIE  ",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Neue Lehrperson",
+        )
+
+        # Erfolgreiche Rückgabe und unveränderte Identität prüfen.
+        self.assertEqual(fehlerliste, [])
+        self.assertIsInstance(ergebnis, Untersuchung)
+        self.assertEqual(ergebnis.pk, self.untersuchung.pk)
+
+        # Die gespeicherten Werte erneut in die Testinstanz laden.
+        self.untersuchung.refresh_from_db()
+
+        # Die neue Schreibweise muss gespeichert sein.
+        # Der interne Vergleichswert bleibt trotz anderer Großschreibung gleich.
+        self.assertEqual(self.untersuchung.studienname, "AUSGANGSSTUDIE")
+        self.assertEqual(
+            self.untersuchung.studienname_vergleich,
+            "ausgangsstudie",
+        )
+        self.assertEqual(self.untersuchung.stundenwert, 1.5)
+
+    def test_fa15_ungueltige_angaben_werden_gemeinsam_abgewiesen(self):
+        # Alle vier bearbeitbaren Angaben sind gleichzeitig ungültig.
+        ergebnis, fehlerliste = korrigiere_untersuchung(
+            untersuchung_id=self.untersuchung.pk,
+            studienname="",
+            stundenwert=0,
+            einordnung="X",
+            lehrperson="   ",
+        )
+
+        # Die Korrektur muss fehlschlagen und Fehlermeldungen zurückgeben.
+        self.assertIsNone(ergebnis)
+
+        # Es müssen vier Fehlermeldungen zurückgegeben werden.
+        self.assertEqual(len(fehlerliste), 4)
+
+        # join() verbindet die Meldungen zu einem Text.
+        # Das Leerzeichen vor .join dient als Trennzeichen zwischen den Meldungen.
+        meldungen = " ".join(fehlerliste)
+
+        for feldname in ["Studienname", "Stundenwert", "Einordnung", "Lehrperson"]:
+            # subTest kennzeichnet jede Einzelprüfung mit dem aktuellen Feldnamen.
+            # Nach einer fehlgeschlagenen Einzelprüfung können die übrigen
+            # Feldnamen weiterhin geprüft werden.
+            with self.subTest(feldname=feldname):
+                self.assertIn(f"{feldname}:", meldungen)
+
+        # Alle Untersuchungen und Teilnahmen müssen dem Ausgangsstand entsprechen.
+        # Die Dictionaries enthalten auch IDs und den Uploadzeitpunkt.
+        self.assertEqual(
+            # list() führt die Abfrage sofort aus und hält den jetzigen Stand fest.
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa15_name_einer_anderen_untersuchung_wird_abgewiesen(self):
+        # Der Name gehört bereits zur zweiten Untersuchung.
+        # Großschreibung und äußere Leerzeichen müssen beim Vergleich
+        # entsprechend der bestehenden Studiennamenprüfung behandelt werden.
+        ergebnis, fehlerliste = korrigiere_untersuchung(
+            untersuchung_id=self.untersuchung.pk,
+            studienname="  ANDERE STUDIE  ",
+            stundenwert=3.0,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Neue Lehrperson",
+        )
+
+        self.assertIsNone(ergebnis)
+        self.assertEqual(len(fehlerliste), 1)
+
+        # Die Fehlermeldung muss den Konflikt mit dem Studiennamen deutlich machen.
+        self.assertTrue(fehlerliste[0].startswith("Studienname:"))
+
+        # Die Untersuchung darf nicht verändert werden.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa15_fehlende_untersuchung_wird_abgewiesen(self):
+        # Eine mögliche freie ID bilden und ihre Abwesenheit ausdrücklich prüfen.
+        fehlende_id = self.andere_untersuchung.pk + 1
+
+        # Die gewählte ID darf nicht in der Datenbank existieren.
+        self.assertFalse(
+            Untersuchung.objects.filter(pk=fehlende_id).exists()
+        )
+
+        # Die Funktion muss eine Fehlermeldung zurückgeben, wenn die Untersuchung nicht existiert, trotz gültiger Eingaben. Die Meldung muss die fehlende Untersuchung eindeutig benennen.
+        ergebnis, fehlerliste = korrigiere_untersuchung(
+            untersuchung_id=fehlende_id,
+            studienname="Neue Studie",
+            stundenwert=2.5,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Neue Lehrperson",
+        )
+
+        # Eine kontrollierte Fehlerrückgabe mit Bezug zur Untersuchung erwarten.
+        self.assertIsNone(ergebnis)
+        self.assertEqual(len(fehlerliste), 1)
+        self.assertTrue(fehlerliste[0].startswith("Untersuchung:"))
+
+        # Eine fehlende Untersuchung darf weder neue Daten anlegen noch vorhandene Untersuchungen oder Teilnahmen verändern.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa15_speicherfehler_wird_kontrolliert_behandelt(self):
+        # Untersuchung.save wird innerhalb des with-Blocks vorübergehend ersetzt.
+        # side_effect löst bei jedem Aufruf den angegebenen DatabaseError aus.
+        # So lässt sich die Fehlerbehandlung prüfen, ohne die echte Speichermethode auszuführen.
+        # Beim Verlassen des Blocks wird die ursprüngliche Methode wiederhergestellt.
+        with patch.object(
+            Untersuchung,
+            "save",
+            side_effect=DatabaseError("Synthetischer Speicherfehler"),
+        ) as speichern:
+            ergebnis, fehlerliste = korrigiere_untersuchung(
+                untersuchung_id=self.untersuchung.pk,
+                studienname="Neue Studie",
+                stundenwert=2.5,
+                einordnung=Untersuchung.ONLINE,
+                lehrperson="Neue Lehrperson",
+            )
+
+        # Sicherstellen, dass die Funktion tatsächlich zu speichern versucht hat.
+        speichern.assert_called_once()
+
+        # Die Funktion muss den Fehler abfangen und kontrolliert zurückgeben.
+        self.assertIsNone(ergebnis)
+        self.assertEqual(fehlerliste, [
+            "Untersuchung: Die Änderungen konnten nicht gespeichert werden."
+        ])
+
+        # Der gespeicherte Untersuchungs- und Teilnahmebestand bleibt erhalten.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+
+class TeilnahmedatenLoeschungTests(TestCase):
+
+    def setUp(self):
+        # Vor jeder Testmethode denselben synthetischen Bestand anlegen.
+        self.matrikelnummer = "1234567"
+
+        self.praesenzuntersuchung = Untersuchung.objects.create(
+            studienname="Präsenzstudie",
+            studienname_vergleich="präsenzstudie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Präsenz",
+        )
+
+        self.onlineuntersuchung = Untersuchung.objects.create(
+            studienname="Onlinestudie",
+            studienname_vergleich="onlinestudie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Testlehrperson Online",
+        )
+
+        # Beide Teilnahmen zusammen erfüllen die Mindestvorgaben.
+        for untersuchung in [
+            self.praesenzuntersuchung,
+            self.onlineuntersuchung,
+        ]:
+            Teilnahme.objects.create(
+                untersuchung=untersuchung,
+                matrikelnummer=self.matrikelnummer,
+            )
+
+        # Die vollständigen gespeicherten Feldwerte festhalten.
+        # Damit können spätere unbeabsichtigte Änderungen erkannt werden.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+    def test_fa18_erfuellte_teilnahmen_werden_geloescht(self):
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=self.matrikelnummer,
+            ablage_bestaetigt=True,
+        )
+
+        self.assertEqual(fehlerliste, [])
+
+        # Beide Teilnahmen und beide dadurch leeren Untersuchungen fehlen.
+        self.assertEqual(Teilnahme.objects.count(), 0)
+        self.assertEqual(Untersuchung.objects.count(), 0)
+
+    def test_fa18_ohne_ablagebestaetigung_bleibt_bestand_erhalten(self):
+        # Die Mindestvorgaben sind erfüllt.
+        # Ausschließlich die Bestätigung der externen Reportablage fehlt.
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=self.matrikelnummer,
+            ablage_bestaetigt=False,
+        )
+
+        self.assertTrue(fehlerliste)
+
+        # Sämtliche gespeicherten Angaben müssen unverändert bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa18_aktuell_zu_wenige_gesamtstunden_verhindern_loeschung(self):
+        # Den zunächst erfüllten Bestand nachträglich verändern.
+        # Danach liegen 29,5 Gesamtstunden und weiterhin 15 Präsenzstunden vor.
+        self.onlineuntersuchung.stundenwert = 14.5
+        self.onlineuntersuchung.save(update_fields=["stundenwert"])
+
+        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=self.matrikelnummer,
+            ablage_bestaetigt=True,
+        )
+
+        # Die Löschung muss abgelehnt werden, da die Mindestvorgaben nicht erfüllt sind.
+        self.assertTrue(fehlerliste)
+
+        # Alle gespeicherten Angaben müssen unverändert bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            untersuchungsbestand,
+        )
+
+        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa18_aktuell_zu_wenige_praesenzstunden_verhindern_loeschung(self):
+        # Die bisherige Präsenzuntersuchung nachträglich als online einordnen.
+        # Die Gesamtstunden bleiben bei 30, die Präsenzstunden sinken auf 0.
+        self.praesenzuntersuchung.einordnung = Untersuchung.ONLINE
+        self.praesenzuntersuchung.save(update_fields=["einordnung"])
+
+        untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=self.matrikelnummer,
+            ablage_bestaetigt=True,
+        )
+
+        # Die Löschung muss abgelehnt werden, da die Mindestvorgaben nicht erfüllt sind.
+        self.assertTrue(fehlerliste)
+
+        # Alle gespeicherten Angaben müssen unverändert bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            untersuchungsbestand,
+        )
+
+        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa18_fehlende_matrikelnummer_veraendert_keine_daten(self):
+        fehlende_matrikelnummer = "9999999"
+
+        # Die Abwesenheit der gewählten Matrikelnummer ausdrücklich prüfen.
+        self.assertFalse(
+            Teilnahme.objects.filter(
+                matrikelnummer=fehlende_matrikelnummer,
+            ).exists()
+        )
+
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=fehlende_matrikelnummer,
+            ablage_bestaetigt=True,
+        )
+
+        # Die Löschung muss abgelehnt werden, da keine Teilnahmen gefunden wurden.
+        self.assertTrue(fehlerliste)
+
+        # Alle gespeicherten Angaben müssen unverändert bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+
+        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa18_untersuchung_mit_fremder_teilnahme_bleibt_erhalten(self):
+        # Eine andere Matrikelnummer derselben Onlineuntersuchung zuordnen.
+        fremde_teilnahme = Teilnahme.objects.create(
+            untersuchung=self.onlineuntersuchung,
+            matrikelnummer="7654321",
+        )
+
+        # Genau diese Untersuchung und diese Teilnahme müssen erhalten bleiben.
+        verbleibender_untersuchungsbestand = list(
+            Untersuchung.objects.filter(
+                pk=self.onlineuntersuchung.pk,
+            ).values()
+        )
+        verbleibender_teilnahmebestand = list(
+            Teilnahme.objects.filter(
+                pk=fremde_teilnahme.pk,
+            ).values()
+        )
+
+        fehlerliste = loesche_teilnahmedaten(
+            matrikelnummer=self.matrikelnummer,
+            ablage_bestaetigt=True,
+        )
+
+        self.assertEqual(fehlerliste, [])
+
+        # Der vollständige Restbestand muss den erwarteten Feldwerten entsprechen.
+        # Damit fehlen zugleich beide Teilnahmen der gelöschten Matrikelnummer
+        # und die dadurch leer gewordene Präsenzuntersuchung.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            verbleibender_untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            verbleibender_teilnahmebestand,
+        )
+
+
+    def test_fa18_datenbankfehler_setzt_teilnahmeloeschung_zurueck(self):
+        # Der Untersuchungszugriff erfolgt im aktuellen Code erst,
+        # nachdem die Teilnahmen gelöscht wurden.
+        # An dieser Stelle einen synthetischen Datenbankfehler auslösen.
+        with patch.object(
+            Untersuchung.objects,
+            "filter",
+            side_effect=DatabaseError("Synthetischer Löschfehler"),
+        ) as untersuchungsabfrage:
+            fehlerliste = loesche_teilnahmedaten(
+                matrikelnummer=self.matrikelnummer,
+                ablage_bestaetigt=True,
+            )
+
+        # Der vorgesehene Fehlerpunkt muss tatsächlich erreicht worden sein.
+        untersuchungsabfrage.assert_called_once()
+
+        self.assertEqual(fehlerliste, [
+            "Die Teilnahmedaten konnten nicht gelöscht werden."
+        ])
+
+        # Die bereits gelöschten Teilnahmen müssen zurückgesetzt worden sein.
+        # Der vollständige Bestand entspricht wieder dem Ausgangszustand.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+
+class TeilnahmedatenLoeschungViewTests(TestCase):
+
+    def setUp(self):
+        # Vor jedem Test einen erfüllten synthetischen Datenbestand anlegen.
+        self.matrikelnummer = "1234567"
+
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Teststudie Löschview",
+            studienname_vergleich="teststudie löschview",
+            stundenwert=30.0,
+            einordnung=Untersuchung.PRAESENZ,
             lehrperson="Testlehrperson",
+        )
+
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer=self.matrikelnummer,
+        )
+
+        # Die gespeicherten Feldwerte für spätere Vergleiche festhalten.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+    def melde_testkonto_an(self, rolle):
+        # Ein synthetisches Konto mit der übergebenen Rolle anlegen.
+        benutzername = "testkonto"
+        passwort = "a" * 64
+
+        konto, fehlerliste = lege_konto_an(
+            benutzername,
+            passwort,
+            rolle,
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+
+        # Die reguläre Anmeldung richtet auch die Sitzungszeitwerte ein.
+        antwort = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": benutzername,
+                "passwort": passwort,
+            },
+        )
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+
+    def pruefe_unveraenderten_bestand(self):
+        # Alle Untersuchungs- und Teilnahmeangaben müssen erhalten bleiben.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa18_administrator_kann_teilnahmedaten_loeschen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.post(
+            "/teilnahmedaten_loeschen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+                "ablage_bestaetigt": "true",
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+
+        # Die Teilnahme und die dadurch leere Untersuchung müssen fehlen.
+        self.assertEqual(Teilnahme.objects.count(), 0)
+        self.assertEqual(Untersuchung.objects.count(), 0)
+
+    def test_qa04_lehrperson_kann_keine_teilnahmedaten_loeschen(self):
+        self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+
+        # Alle Löschvoraussetzungen außer der berechtigten Rolle liegen vor.
+        antwort = self.client.post(
+            "/teilnahmedaten_loeschen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+                "ablage_bestaetigt": "true",
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()["erfolg"])
+        self.pruefe_unveraenderten_bestand()
+
+    def test_qa04_loeschung_ohne_anmeldung_wird_abgewiesen(self):
+        # Der Testclient wurde in diesem Test nicht angemeldet.
+        antwort = self.client.post(
+            "/teilnahmedaten_loeschen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+                "ablage_bestaetigt": "true",
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertFalse(antwort.json()["erfolg"])
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa18_get_anfrage_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.get("/teilnahmedaten_loeschen/")
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertFalse(antwort.json()["erfolg"])
+
+        # Der Antwortheader nennt ausschließlich POST als erlaubte Methode.
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa18_fehlende_matrikelnummer_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Die in der View verwendete Löschfunktion vorübergehend ersetzen,
+        # um einen möglichen Aufruf zu erfassen.
+        with patch(
+            "vp_stunden.views.loesche_teilnahmedaten"
+        ) as loeschfunktion:
+            antwort = self.client.post(
+                "/teilnahmedaten_loeschen/",
+                data={
+                    "ablage_bestaetigt": "true",
+                },
+            )
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()["erfolg"])
+
+        # Die fehlende Angabe muss bereits in der View abgefangen werden.
+        loeschfunktion.assert_not_called()
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa18_ohne_ablagebestaetigung_wird_loeschung_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Sowohl ein fehlendes Feld als auch den Formulartext "false" prüfen.
+        testfaelle = [
+            {
+                "matrikelnummer": self.matrikelnummer,
+            },
+            {
+                "matrikelnummer": self.matrikelnummer,
+                "ablage_bestaetigt": "false",
+            },
+        ]
+
+        for daten in testfaelle:
+            with self.subTest(daten=daten):
+                antwort = self.client.post(
+                    "/teilnahmedaten_loeschen/",
+                    data=daten,
+                )
+
+                self.assertEqual(antwort.status_code, 400)
+                self.assertFalse(antwort.json()["erfolg"])
+                self.assertTrue(antwort.json()["fehlerliste"])
+                self.pruefe_unveraenderten_bestand()
+
+    def test_fa18_nicht_erfuellte_mindestvorgaben_verhindern_loeschung(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Den gespeicherten Stundenwert unter die Gesamtstundengrenze senken.
+        self.untersuchung.stundenwert = 29.5
+        self.untersuchung.save(update_fields=["stundenwert"])
+
+        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+        antwort = self.client.post(
+            "/teilnahmedaten_loeschen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+                "ablage_bestaetigt": "true",
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()["erfolg"])
+        self.assertTrue(antwort.json()["fehlerliste"])
+        self.pruefe_unveraenderten_bestand()
+
+
+class TeilnahmesucheViewTests(TestCase):
+
+    def setUp(self):
+        self.matrikelnummer = "1234567"
+
+        # Untersuchungen bewusst entgegen der erwarteten A–Z-Reihenfolge anlegen.
+        self.untersuchung_beta = Untersuchung.objects.create(
+            studienname="Beta-Studie",
+            studienname_vergleich="beta-studie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Beta",
         )
 
         self.untersuchung_alpha = Untersuchung.objects.create(
-            studienname="alpha Studie",
-            studienname_vergleich="alpha studie",
-            stundenwert=1.0,
-            einordnung=Untersuchung.PRAESENZ,
-            lehrperson="Testlehrperson",
+            studienname="Alpha-Studie",
+            studienname_vergleich="alpha-studie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Testlehrperson Alpha",
         )
 
-        # Umlaute und ß prüfen die Unicode-Vergleichsregel.
-        self.untersuchung_gedaechtnis = Untersuchung.objects.create(
-            studienname="Gedächtnisstraße",
-            studienname_vergleich="gedächtnisstrasse",
-            stundenwert=1.0,
-            einordnung=Untersuchung.PRAESENZ,
-            lehrperson="Testlehrperson",
+        # Einen bekannten Testzeitpunkt ohne Mikrosekunden verwenden.
+        # Dadurch lässt sich der Zeitpunkt nach der JSON-Ausgabe einfach vergleichen.
+        self.uploadzeitpunkt = timezone.now().replace(microsecond=0)
+        Untersuchung.objects.update(
+            uploadzeitpunkt=self.uploadzeitpunkt,
         )
 
-    def test_fa14_vollname_und_namensteil_liefern_sortierte_treffer(self):
-        # Jeweils Suchtext und ausdrücklich erwartete Ergebnisliste festlegen.
-        testfaelle = [
-            ("alpha Studie", [self.untersuchung_alpha]),
-            ("ALPHA STUDIE", [self.untersuchung_alpha]),
-            ("StUdIe",[self.untersuchung_alpha, self.untersuchung_beta]),
-            ("Gedächtnisstraße", [self.untersuchung_gedaechtnis]),
-            ("GEDÄCHTNISSTRASSE", [self.untersuchung_gedaechtnis]),
-            ("DÄCHTNIS", [self.untersuchung_gedaechtnis]),
-        ]
+        # Beide Untersuchungen der gesuchten Matrikelnummer zuordnen.
+        for untersuchung in [
+            self.untersuchung_beta,
+            self.untersuchung_alpha,
+        ]:
+            Teilnahme.objects.create(
+                untersuchung=untersuchung,
+                matrikelnummer=self.matrikelnummer,
+            )
 
-        for suchtext, erwartet in testfaelle:
-            with self.subTest(suchtext=suchtext):
-                ergebnis = suche_untersuchungen(suchtext)
+        # Diese fremde Teilnahme darf nicht im Suchergebnis erscheinen.
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung_beta,
+            matrikelnummer="7654321",
+        )
 
-                # Rückgabetyp, passende Untersuchungen und Reihenfolge prüfen.
-                self.assertIsInstance(ergebnis, list)
-                self.assertEqual(ergebnis, erwartet)
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
 
-    def test_fa14_fehlender_studienname_liefert_leere_liste(self):
-        # Trotz vorhandener Untersuchungen gibt es keinen passenden Treffer.
-        ergebnis = suche_untersuchungen("Unbekannte Untersuchung")
+    def melde_testkonto_an(self, rolle):
+        benutzername = "testkonto"
+        passwort = "a" * 64
 
-        self.assertEqual(ergebnis, [])
+        konto, fehlerliste = lege_konto_an(
+            benutzername,
+            passwort,
+            rolle,
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
 
-    def test_leerer_suchtext_liefert_alle_untersuchungen(self):
-        # Das besprochene Verhalten bei leerem Suchtext festhalten.
-        ergebnis = suche_untersuchungen("")
+        # Die reguläre Anmeldung richtet auch die Sitzungszeitwerte ein.
+        antwort = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": benutzername,
+                "passwort": passwort,
+            },
+        )
 
-        self.assertEqual(ergebnis, [
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+
+    def pruefe_unveraenderten_bestand(self):
+        # Eine Suche darf die gespeicherten VP-Daten nicht verändern.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa14_administrator_erhaelt_sortierte_teilnahmen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.post(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 200)
+        ergebnis = antwort.json()
+        self.assertTrue(ergebnis["erfolg"])
+
+        # Genau die beiden Teilnahmen der gesuchten Matrikelnummer erwarten.
+        self.assertEqual(len(ergebnis["teilnahmen"]), 2)
+
+        erwartete_untersuchungen = [
             self.untersuchung_alpha,
             self.untersuchung_beta,
-            self.untersuchung_gedaechtnis,
+        ]
+
+        # Jede Antwortzeile mit der Untersuchung an der erwarteten Position verbinden.
+        # Damit werden zugleich Reihenfolge und Feldzuordnung geprüft.
+        for zeile, untersuchung in zip(
+            ergebnis["teilnahmen"],
+            erwartete_untersuchungen,
+        ):
+            with self.subTest(studienname=untersuchung.studienname):
+                self.assertEqual(
+                    zeile["matrikelnummer"],
+                    self.matrikelnummer,
+                )
+                self.assertEqual(
+                    zeile["studienname"],
+                    untersuchung.studienname,
+                )
+                self.assertEqual(
+                    zeile["stundenwert"],
+                    untersuchung.stundenwert,
+                )
+                self.assertEqual(
+                    zeile["einordnung"],
+                    untersuchung.einordnung,
+                )
+                self.assertEqual(
+                    zeile["lehrperson"],
+                    untersuchung.lehrperson,
+                )
+
+                # datetime.fromisoformat(...) wandelt den Uploadzeitpunkt aus der JSON-Antwort von einer Zeichenfolge in einen Zeitpunkt um.
+                self.assertEqual(
+                    datetime.fromisoformat(zeile["uploadzeitpunkt"]),
+                    self.uploadzeitpunkt,
+                )
+
+        # Die fremde Teilnahme darf auch die Berechnung nicht beeinflussen.
+        self.assertEqual(ergebnis["berechnung"], {
+            "praesenzstunden": 15.0,
+            "onlinestunden": 15.0,
+            "gesamtstunden": 30.0,
+            "erfuellt": True,
+        })
+
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa16_nicht_erfuellter_status_wird_angezeigt(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Die Gesamtstunden auf 29,5 senken.
+        self.untersuchung_alpha.stundenwert = 14.5
+        self.untersuchung_alpha.save(update_fields=["stundenwert"])
+
+        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+        antwort = self.client.post(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+            },
+        )
+
+        # Die Suche bleibt auch bei nicht erfüllten Mindestvorgaben erfolgreich.
+        self.assertEqual(antwort.status_code, 200)
+        ergebnis = antwort.json()
+        self.assertTrue(ergebnis["erfolg"])
+        self.assertEqual(len(ergebnis["teilnahmen"]), 2)
+
+        self.assertEqual(ergebnis["berechnung"], {
+            "praesenzstunden": 15.0,
+            "onlinestunden": 14.5,
+            "gesamtstunden": 29.5,
+            "erfuellt": False,
+        })
+
+        self.pruefe_unveraenderten_bestand()
+
+    def test_qa04_lehrperson_kann_keine_teilnahmen_suchen(self):
+        self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+
+        antwort = self.client.post(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+
+        # Bei verweigertem Zugriff dürfen keine Ergebnisdaten enthalten sein.
+        self.assertNotIn("teilnahmen", ergebnis)
+        self.assertNotIn("berechnung", ergebnis)
+        self.pruefe_unveraenderten_bestand()
+
+    def test_qa04_suche_ohne_anmeldung_wird_abgewiesen(self):
+        antwort = self.client.post(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("teilnahmen", ergebnis)
+        self.assertNotIn("berechnung", ergebnis)
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa14_get_anfrage_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.get(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": self.matrikelnummer,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertFalse(antwort.json()["erfolg"])
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa14_fehlende_matrikelnummer_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Den in der View verwendeten Funktionsnamen vorübergehend ersetzen.
+        with patch(
+            "vp_stunden.views.suche_teilnahmen"
+        ) as suchfunktion:
+            antwort = self.client.post(
+                "/teilnahmen_suchen/",
+                data={},
+            )
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()["erfolg"])
+
+        # Die unvollständige Anfrage muss vor dem Suchaufruf abgewiesen werden.
+        suchfunktion.assert_not_called()
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa14_fehlende_treffer_werden_gemeldet(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        fehlende_matrikelnummer = "9999999"
+
+        self.assertFalse(
+            Teilnahme.objects.filter(
+                matrikelnummer=fehlende_matrikelnummer,
+            ).exists()
+        )
+
+        antwort = self.client.post(
+            "/teilnahmen_suchen/",
+            data={
+                "matrikelnummer": fehlende_matrikelnummer,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 404)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+
+        # Ohne Treffer werden weder Teilnahmeangaben noch Summen ausgegeben.
+        self.assertNotIn("teilnahmen", ergebnis)
+        self.assertNotIn("berechnung", ergebnis)
+        self.pruefe_unveraenderten_bestand()
+
+
+class UntersuchungssucheViewTests(TestCase):
+
+    def setUp(self):
+        # Untersuchungen entgegen der erwarteten A–Z-Reihenfolge anlegen.
+        self.beta = Untersuchung.objects.create(
+            studienname="Beta-Studie",
+            studienname_vergleich="beta-studie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Testlehrperson Beta",
+        )
+        self.alpha = Untersuchung.objects.create(
+            studienname="Alpha-Studie",
+            studienname_vergleich="alpha-studie",
+            stundenwert=2.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alpha",
+        )
+        self.gamma = Untersuchung.objects.create(
+            studienname="Gamma-Projekt",
+            studienname_vergleich="gamma-projekt",
+            stundenwert=1.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Gamma",
+        )
+
+    def melde_testkonto_an(self, rolle):
+        testpasswort = "a" * 64
+        konto, fehlerliste = lege_konto_an(
+            "testkonto",
+            testpasswort,
+            rolle,
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+
+        # Die reguläre Anmeldung richtet die Sitzungsdaten ein.
+        anmeldung = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": "testkonto",
+                "passwort": testpasswort,
+            },
+        )
+        self.assertEqual(anmeldung.status_code, 200)
+        self.assertTrue(anmeldung.json()["erfolg"])
+
+    def test_fa14_administrator_erhaelt_passende_sortierte_untersuchungen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Teilnamensuche und ignorierte Groß-/Kleinschreibung prüfen.
+        antwort = self.client.post(
+            "/untersuchungen_suchen/",
+            data={"suchtext": "sTuDiE"},
+        )
+        self.assertEqual(antwort.status_code, 200)
+
+        ergebnis = antwort.json()
+        self.assertTrue(ergebnis["erfolg"])
+        self.assertEqual(len(ergebnis["untersuchungen"]), 2)
+
+        # Genau Alpha und Beta in dieser Reihenfolge erwarten.
+        for zeile, untersuchung in zip(
+            ergebnis["untersuchungen"],
+            [self.alpha, self.beta],
+        ):
+            self.assertEqual(zeile["untersuchung_id"], untersuchung.pk)
+            self.assertEqual(zeile["studienname"], untersuchung.studienname)
+            self.assertEqual(zeile["stundenwert"], untersuchung.stundenwert)
+            self.assertEqual(zeile["einordnung"], untersuchung.einordnung)
+            self.assertEqual(zeile["lehrperson"], untersuchung.lehrperson)
+
+            # Den Antworttext für den Vergleich in einen Zeitpunkt umwandeln.
+            self.assertEqual(
+                datetime.fromisoformat(zeile["uploadzeitpunkt"]),
+                untersuchung.uploadzeitpunkt,
+            )
+
+    def test_qa04_suche_ohne_anmeldung_wird_abgewiesen(self):
+        antwort = self.client.post(
+            "/untersuchungen_suchen/",
+            data={"suchtext": "Studie"},
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchungen", ergebnis)
+
+    def test_qa04_lehrperson_kann_keine_untersuchungen_suchen(self):
+        self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+
+        antwort = self.client.post(
+            "/untersuchungen_suchen/",
+            data={"suchtext": "Studie"},
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchungen", ergebnis)
+
+    def test_fa14_get_anfrage_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.get(
+            "/untersuchungen_suchen/",
+            data={"suchtext": "Studie"},
+        )
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.assertFalse(antwort.json()["erfolg"])
+
+    def test_fa14_fehlender_suchtext_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Prüfen, dass die unvollständige Anfrage vor der Suche abbricht.
+        with patch(
+            "vp_stunden.views.suche_untersuchungen"
+        ) as suchfunktion:
+            antwort = self.client.post(
+                "/untersuchungen_suchen/",
+                data={},
+            )
+
+        self.assertEqual(antwort.status_code, 400)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchungen", ergebnis)
+        suchfunktion.assert_not_called()
+
+    def test_fa14_fehlende_treffer_werden_gemeldet(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self.client.post(
+            "/untersuchungen_suchen/",
+            data={"suchtext": "Unbekannte Untersuchung"},
+        )
+
+        self.assertEqual(antwort.status_code, 404)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchungen", ergebnis)
+
+    def test_fa14_leerer_suchtext_liefert_alle_untersuchungen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Ein ausdrücklich leerer Suchtext öffnet die Gesamtübersicht.
+        antwort = self.client.post(
+            "/untersuchungen_suchen/",
+            data={"suchtext": ""},
+        )
+        self.assertEqual(antwort.status_code, 200)
+
+        ergebnis = antwort.json()
+        self.assertTrue(ergebnis["erfolg"])
+
+        gefundene_ids = []
+        for zeile in ergebnis["untersuchungen"]:
+            gefundene_ids.append(zeile["untersuchung_id"])
+
+        # Vollständigkeit und feste A–Z-Reihenfolge gemeinsam prüfen.
+        self.assertEqual(
+            gefundene_ids,
+            [self.alpha.pk, self.beta.pk, self.gamma.pk],
+        )
+
+
+class UntersuchungskorrekturViewTests(TestCase):
+
+    def setUp(self):
+        # Vor jedem Test einen Ausgangsbestand an Untersuchungen anlegen.
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Ausgangsstudie",
+            studienname_vergleich="ausgangsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Alte Lehrperson",
+        )
+
+        # Die ID und den Upload-Zeitpunkt der Untersuchung speichern.
+        self.untersuchung_id = self.untersuchung.pk
+        self.uploadzeitpunkt = self.untersuchung.uploadzeitpunkt
+
+        # Alle Angaben senden, ausschließlich den Stundenwert ändern.
+        self.daten = {
+            "untersuchung_id": str(self.untersuchung_id),
+            "studienname": "Ausgangsstudie",
+            "stundenwert": "2.5",
+            "einordnung": Untersuchung.PRAESENZ,
+            "lehrperson": "Alte Lehrperson",
+        }
+
+        # Den gespeicherten Ausgangsbestand für Fehlerfälle festhalten.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+
+    def melde_testkonto_an(self, rolle):
+        testpasswort = "a" * 64
+        konto, fehlerliste = lege_konto_an(
+            "testkonto",
+            testpasswort,
+            rolle,
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+
+        anmeldung = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": "testkonto",
+                "passwort": testpasswort,
+            },
+        )
+        self.assertEqual(anmeldung.status_code, 200)
+        self.assertTrue(anmeldung.json()["erfolg"])
+
+    def pruefe_unveraenderten_bestand(self):
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+
+    def test_fa15_einzelner_stundenwert_wird_korrigiert(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Die Korrektur muss erfolgreich sein, da alle Angaben vollständig und korrekt sind.
+        antwort = self.client.post(
+            "/untersuchung_korrigieren/",
+            data=self.daten,
+        )
+        self.assertEqual(antwort.status_code, 200)
+
+        ergebnis = antwort.json()
+        self.assertTrue(ergebnis["erfolg"])
+        zeile = ergebnis["untersuchung"]
+
+        # Die Antwort enthält den neuen Stundenwert und die übrigen Angaben.
+        self.assertEqual(zeile["untersuchung_id"], self.untersuchung_id)
+        self.assertEqual(zeile["studienname"], "Ausgangsstudie")
+        self.assertEqual(zeile["stundenwert"], 2.5)
+        self.assertEqual(zeile["einordnung"], Untersuchung.PRAESENZ)
+        self.assertEqual(zeile["lehrperson"], "Alte Lehrperson")
+        self.assertEqual(
+            datetime.fromisoformat(zeile["uploadzeitpunkt"]),
+            self.uploadzeitpunkt,
+        )
+
+        # Den tatsächlichen Datenbankstand prüfen.
+        self.untersuchung.refresh_from_db()
+        self.assertEqual(self.untersuchung.pk, self.untersuchung_id)
+        self.assertEqual(self.untersuchung.studienname, "Ausgangsstudie")
+        self.assertEqual(
+            self.untersuchung.studienname_vergleich,
+            "ausgangsstudie",
+        )
+        self.assertEqual(self.untersuchung.stundenwert, 2.5)
+        self.assertEqual(
+            self.untersuchung.einordnung,
+            Untersuchung.PRAESENZ,
+        )
+        self.assertEqual(self.untersuchung.lehrperson, "Alte Lehrperson")
+        self.assertEqual(
+            self.untersuchung.uploadzeitpunkt,
+            self.uploadzeitpunkt,
+        )
+
+    def test_qa04_korrektur_ohne_anmeldung_wird_abgewiesen(self):
+        antwort = self.client.post(
+            "/untersuchung_korrigieren/",
+            data=self.daten,
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchung", ergebnis)
+        self.pruefe_unveraenderten_bestand()
+
+    def test_qa04_lehrperson_kann_keine_untersuchung_korrigieren(self):
+        self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+
+        antwort = self.client.post(
+            "/untersuchung_korrigieren/",
+            data=self.daten,
+        )
+
+        self.assertEqual(antwort.status_code, 403)
+        ergebnis = antwort.json()
+        self.assertFalse(ergebnis["erfolg"])
+        self.assertNotIn("untersuchung", ergebnis)
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa15_get_anfrage_wird_abgewiesen(self):
+        antwort = self.client.get(
+            "/untersuchung_korrigieren/",
+            data=self.daten,
+        )
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.assertFalse(antwort.json()["erfolg"])
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa15_fehlende_parameter_werden_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        for schluessel, feldname in [
+            ("untersuchung_id", "Untersuchung"),
+            ("studienname", "Studienname"),
+            ("stundenwert", "Stundenwert"),
+            ("einordnung", "Einordnung"),
+            ("lehrperson", "Lehrperson"),
+        ]:
+            with self.subTest(parameter=schluessel):
+                daten = self.daten.copy()
+                daten.pop(schluessel)
+
+                # Die Verarbeitung darf bei fehlenden Angaben nicht beginnen.
+                with patch(
+                    "vp_stunden.views.korrigiere_untersuchung"
+                ) as korrekturfunktion:
+                    antwort = self.client.post(
+                        "/untersuchung_korrigieren/",
+                        data=daten,
+                    )
+
+                self.assertEqual(antwort.status_code, 400)
+                ergebnis = antwort.json()
+                self.assertFalse(ergebnis["erfolg"])
+                self.assertTrue(ergebnis["fehlerliste"])
+                self.assertIn(
+                    feldname,
+                    " ".join(ergebnis["fehlerliste"]),
+                )
+                korrekturfunktion.assert_not_called()
+                self.pruefe_unveraenderten_bestand()
+
+    def test_fa15_ungueltige_zahlen_werden_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        for schluessel, feldname in [
+            ("untersuchung_id", "Untersuchung"),
+            ("stundenwert", "Stundenwert"),
+        ]:
+            with self.subTest(parameter=schluessel):
+                daten = self.daten.copy()
+                daten[schluessel] = "keine Zahl"
+
+                with patch(
+                    "vp_stunden.views.korrigiere_untersuchung"
+                ) as korrekturfunktion:
+                    antwort = self.client.post(
+                        "/untersuchung_korrigieren/",
+                        data=daten,
+                    )
+
+                self.assertEqual(antwort.status_code, 400)
+                ergebnis = antwort.json()
+                self.assertFalse(ergebnis["erfolg"])
+                self.assertTrue(ergebnis["fehlerliste"])
+                self.assertIn(
+                    feldname,
+                    " ".join(ergebnis["fehlerliste"]),
+                )
+                korrekturfunktion.assert_not_called()
+                self.pruefe_unveraenderten_bestand()
+
+    def test_fa15_inhaltliche_fehler_werden_zurueckgegeben(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Diese Angaben erreichen die vorhandenen Feldprüfungen.
+        for schluessel, wert, feldname in [
+            ("studienname", "", "Studienname"),
+            ("stundenwert", "1.25", "Stundenwert"),
+        ]:
+            with self.subTest(parameter=schluessel):
+                daten = self.daten.copy()
+                daten[schluessel] = wert
+
+                antwort = self.client.post(
+                    "/untersuchung_korrigieren/",
+                    data=daten,
+                )
+
+                self.assertEqual(antwort.status_code, 400)
+                ergebnis = antwort.json()
+                self.assertFalse(ergebnis["erfolg"])
+                self.assertTrue(ergebnis["fehlerliste"])
+                self.assertIn(
+                    feldname,
+                    " ".join(ergebnis["fehlerliste"]),
+                )
+                self.assertNotIn("untersuchung", ergebnis)
+                self.pruefe_unveraenderten_bestand()
+
+
+class ReporterzeugungViewTests(TestCase):
+
+    def setUp(self):
+        self.matrikelnummer = "1234567"
+        self.daten = {"matrikelnummer": self.matrikelnummer}
+
+        # Untersuchungen zuerst in alphabetischer Reihenfolge anlegen.
+        self.untersuchung_alpha = Untersuchung.objects.create(
+            studienname="Alpha-Studie",
+            studienname_vergleich="alpha-studie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.ONLINE,
+            lehrperson="Testlehrperson Alpha",
+        )
+        self.untersuchung_beta = Untersuchung.objects.create(
+            studienname="Beta-Studie",
+            studienname_vergleich="beta-studie",
+            stundenwert=15.0,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Beta",
+        )
+
+        # Die Teilnahmezuordnungen in der erwarteten Reportreihenfolge anlegen.
+        self.teilnahme_beta = Teilnahme.objects.create(
+            untersuchung=self.untersuchung_beta,
+            matrikelnummer=self.matrikelnummer,
+        )
+        self.teilnahme_alpha = Teilnahme.objects.create(
+            untersuchung=self.untersuchung_alpha,
+            matrikelnummer=self.matrikelnummer,
+        )
+
+        # Diese fremde Teilnahme darf im Report nicht berücksichtigt werden.
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung_alpha,
+            matrikelnummer="7654321",
+        )
+
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+    def melde_testkonto_an(self, rolle):
+        testpasswort = "a" * 64
+        konto, fehlerliste = lege_konto_an(
+            "testkonto",
+            testpasswort,
+            rolle,
+        )
+        self.assertIsNotNone(konto)
+        self.assertFalse(fehlerliste)
+
+        # Die reguläre Anmeldung richtet die erforderlichen Sitzungsdaten ein.
+        anmeldung = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": "testkonto",
+                "passwort": testpasswort,
+            },
+        )
+        self.assertEqual(anmeldung.status_code, 200)
+        self.assertTrue(anmeldung.json()["erfolg"])
+
+    def pruefe_unveraenderten_bestand(self):
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def pruefe_abweisung(self, daten, status):
+        # Bei einer abgewiesenen Anfrage darf keine PDF-Erzeugung stattfinden.
+        with patch(
+            "vp_stunden.views.erzeuge_report"
+        ) as reportfunktion:
+            antwort = self.client.post(
+                "/report_erzeugen/",
+                data=daten,
+            )
+
+        self.assertEqual(antwort.status_code, status)
+        self.assertFalse(antwort.json()["erfolg"])
+        reportfunktion.assert_not_called()
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa17_administrator_erhaelt_pdf_in_importreihenfolge(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # wraps führt die echte Funktion aus und hält ihre Aufrufargumente fest.
+        with patch(
+            "vp_stunden.views.erzeuge_report",
+            wraps=erzeuge_report,
+        ) as reportfunktion:
+            antwort = self.client.post(
+                "/report_erzeugen/",
+                data=self.daten,
+            )
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(
+            antwort.headers["Content-Type"],
+            "application/pdf",
+        )
+        self.assertEqual(
+            antwort.headers["Content-Disposition"],
+            'attachment; filename="vp_stunden_1234567.pdf"',
+        )
+
+        # Anfangs- und Endmarkierung der erzeugten PDF-Daten prüfen.
+        self.assertTrue(antwort.content.startswith(b"%PDF-"))
+        self.assertTrue(antwort.content.rstrip().endswith(b"%%EOF"))
+
+        reportfunktion.assert_called_once()
+        matrikelnummer, teilnahmen, berechnung = (
+            reportfunktion.call_args.args
+        )
+
+        self.assertEqual(matrikelnummer, self.matrikelnummer)
+
+        # Genau die passenden Teilnahmen in ihrer Anlagereihenfolge erwarten.
+        teilnahme_ids = [teilnahme.pk for teilnahme in teilnahmen]
+        self.assertEqual(
+            teilnahme_ids,
+            [self.teilnahme_beta.pk, self.teilnahme_alpha.pk],
+        )
+
+        self.assertEqual(
+            berechnung,
+            {
+                "praesenzstunden": 15.0,
+                "onlinestunden": 15.0,
+                "gesamtstunden": 30.0,
+                "erfuellt": True,
+            },
+        )
+        self.pruefe_unveraenderten_bestand()
+
+    def test_qa04_report_ohne_anmeldung_wird_abgewiesen(self):
+        self.pruefe_abweisung(self.daten, 403)
+
+    def test_qa04_lehrperson_kann_keinen_report_erzeugen(self):
+        self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        self.pruefe_abweisung(self.daten, 403)
+
+    def test_fa17_get_anfrage_wird_abgewiesen(self):
+        with patch(
+            "vp_stunden.views.erzeuge_report"
+        ) as reportfunktion:
+            antwort = self.client.get(
+                "/report_erzeugen/",
+                data=self.daten,
+            )
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.assertFalse(antwort.json()["erfolg"])
+        reportfunktion.assert_not_called()
+        self.pruefe_unveraenderten_bestand()
+
+    def test_fa17_fehlende_matrikelnummer_wird_abgewiesen(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Einen fehlenden Schlüssel und einen ausdrücklich leeren Wert prüfen.
+        for daten in [{}, {"matrikelnummer": ""}]:
+            with self.subTest(daten=daten):
+                self.pruefe_abweisung(daten, 400)
+
+    def test_fa17_fehlende_teilnahmen_werden_gemeldet(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        self.pruefe_abweisung(
+            {"matrikelnummer": "9999999"},
+            404,
+        )
+
+    def test_fa17_nicht_erfuellter_status_verhindert_report(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        # Fall 1: 29,5 Gesamtstunden bei 15 Präsenzstunden.
+        # Fall 2: 30 Gesamtstunden bei nur 14,5 Präsenzstunden.
+        for online, praesenz in [(14.5, 15.0), (15.5, 14.5)]:
+            with self.subTest(online=online, praesenz=praesenz):
+                self.untersuchung_alpha.stundenwert = online
+                self.untersuchung_alpha.save(
+                    update_fields=["stundenwert"]
+                )
+                self.untersuchung_beta.stundenwert = praesenz
+                self.untersuchung_beta.save(
+                    update_fields=["stundenwert"]
+                )
+
+                # Die bewusst geänderten Werte sind der neue Vergleichsstand.
+                self.untersuchungsbestand = list(
+                    Untersuchung.objects.order_by("pk").values()
+                )
+
+                self.pruefe_abweisung(self.daten, 400)
+
+    def test_fa17_erzeugungsfehler_wird_kontrolliert_beantwortet(self):
+        self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        interner_fehler = "INTERNER_TESTFEHLER"
+
+        # Einen technischen Fehler ausschließlich für diesen Aufruf auslösen.
+        with patch(
+            "vp_stunden.views.erzeuge_report",
+            side_effect=RuntimeError(interner_fehler),
+        ) as reportfunktion:
+            antwort = self.client.post(
+                "/report_erzeugen/",
+                data=self.daten,
+            )
+
+        self.assertEqual(antwort.status_code, 500)
+        self.assertFalse(antwort.json()["erfolg"])
+        self.assertNotIn(
+            interner_fehler,
+            antwort.content.decode("utf-8"),
+        )
+        reportfunktion.assert_called_once()
+        self.pruefe_unveraenderten_bestand()
+
+
+class UebergangsimportZuordnungTests(TestCase):
+    """Prüft Zuordnung, Datenübernahme und vollständige Abweisung."""
+
+    def setUp(self):
+        # Django ruft setUp vor jeder Testmethode neu auf.
+        # Alle Daten entstehen ausschließlich in der gesonderten Testdatenbank.
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="7654321",
+        )
+
+        # values() erfasst sämtliche gespeicherten Felder einschließlich IDs
+        # und Uploadzeitpunkt. list() hält den jetzigen Stand sofort fest.
+        # Dadurch reichen später gleich gebliebene Anzahlen allein nicht aus.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        # Die Testdatei wird in der Testdatenbank erzeugt, nicht auf der Festplatte.
+        self.arbeitsmappe = Workbook()
+        self.addCleanup(self.arbeitsmappe.close)
+        self.blatt = self.arbeitsmappe.active
+        self.blatt.title = "Übergangsimport"
+        self.blatt.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
         ])
+
+        # Zeile 2 ergänzt die vorhandene Untersuchung. Andere Großschreibung
+        # und äußere Leerzeichen dürfen die Zuordnung nicht verhindern.
+        self.blatt.append([
+            1234567,
+            "  BESTANDSSTUDIE  ",
+            1.5,
+            Untersuchung.PRAESENZ,
+            "  TESTLEHRPERSON ALT  ",
+        ])
+
+        # Die Leerzeile darf die Prüfung der folgenden Zeile nicht beenden.
+        self.blatt.append([None, None, None, None, None])
+        self.blatt.append([
+            1234567,
+            "  Neue Studie  ",
+            2.5,
+            Untersuchung.ONLINE,
+            "  Testlehrperson Neu  ",
+        ])
+
+    def test_fa11_neue_und_vorhandene_untersuchung_werden_importiert(self):
+        # BytesIO ersetzt eine Datei auf der Festplatte.
+        # SimpleUploadedFile stellt die erzeugten XLSX-Bytes als Upload bereit.
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        beginn = timezone.now()
+        fehlerliste = importiere_uebergangsdatei(datei)
+        ende = timezone.now()
+
+        self.assertEqual(fehlerliste, [])
+
+        neue_untersuchung = Untersuchung.objects.get(
+            studienname_vergleich="neue studie"
+        )
+        self.assertEqual(
+            (
+                neue_untersuchung.studienname,
+                neue_untersuchung.stundenwert,
+                neue_untersuchung.einordnung,
+                neue_untersuchung.lehrperson,
+            ),
+            ("Neue Studie", 2.5, Untersuchung.ONLINE, "Testlehrperson Neu"),
+        )
+        self.assertGreaterEqual(neue_untersuchung.uploadzeitpunkt, beginn)
+        self.assertLessEqual(neue_untersuchung.uploadzeitpunkt, ende)
+
+        # Außer der einen neuen Untersuchung muss der vollständige alte
+        # Untersuchungsbestand erhalten sein, auch Schreibweise und Zeitpunkt.
+        self.assertEqual(
+            list(
+                Untersuchung.objects.exclude(
+                    pk=neue_untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            self.untersuchungsbestand,
+        )
+
+        # Beide neuen Teilnahmen gehören zur importierten Matrikelnummer.
+        # Die IDs zeigen zugleich die Zuordnung und die Anlage in Zeilenfolge.
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values_list("untersuchung_id", flat=True)
+            ),
+            [self.untersuchung.pk, neue_untersuchung.pk],
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values()
+            ),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_unterschiedliche_matrikelnummern_werden_abgewiesen(self):
+        self.blatt["A4"] = 2345678
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        # Die Zellfundstelle prüfen, ohne den gesamten Meldungstext festzulegen.
+        # any() verlangt mindestens eine passende Meldung.
+        self.assertTrue(
+            any(meldung.startswith("A4:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa12_doppelte_untersuchung_in_datei_wird_abgewiesen(self):
+        # Zeile 5 wiederholt die neue Untersuchung mit anderer Schreibweise.
+        # Auch die gültige Ergänzung aus Zeile 2 darf dann nicht gespeichert werden.
+        self.blatt.append([
+            1234567,
+            "  NEUE STUDIE  ",
+            2.5,
+            Untersuchung.ONLINE,
+            "Testlehrperson Neu",
+        ])
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertTrue(
+            any(meldung.startswith("B5:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa12_bereits_gespeicherte_teilnahme_wird_abgewiesen(self):
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="1234567",
+        )
+
+        # Diese zusätzliche Teilnahme gehört jetzt zum vorbereiteten Bestand.
+        teilnahmebestand_vor_import = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertTrue(
+            any(meldung.startswith("Zeile 2:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            teilnahmebestand_vor_import,
+        )
+
+    def test_fa12_abweichende_bestandsangaben_werden_abgewiesen(self):
+        # Jeder Wert ist für sich zulässig, widerspricht aber dem Bestand.
+        # Einzeln prüfen, damit kein anderer Fehler eine fehlende Prüfung verdeckt.
+        for adresse, abweichender_wert in [
+            ("C2", 2.0),
+            ("D2", Untersuchung.ONLINE),
+            ("E2", "Andere Testlehrperson"),
+        ]:
+            with self.subTest(zelle=adresse):
+                urspruenglicher_wert = self.blatt[adresse].value
+                self.blatt[adresse] = abweichender_wert
+
+                # Jeder Teilfall braucht einen neuen Upload, weil die
+                # Importfunktion den vorherigen Upload bereits geschlossen hat.
+                with BytesIO() as puffer:
+                    self.arbeitsmappe.save(puffer)
+                    datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+                fehlerliste = importiere_uebergangsdatei(datei)
+
+                # Das gemeinsame Workbook für den nächsten Teilfall zurücksetzen.
+                self.blatt[adresse] = urspruenglicher_wert
+
+                self.assertTrue(
+                    any(
+                        meldung.startswith(f"{adresse}:")
+                        for meldung in fehlerliste
+                    ),
+                    fehlerliste,
+                )
+                self.assertEqual(
+                    list(Untersuchung.objects.order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_fa11_zellfehler_werden_gesammelt_und_datei_abgewiesen(self):
+        # Zeile 4 ist teilweise gefüllt und muss vollständig geprüft werden.
+        # Der ungültige Stundenwert darf die Prüfung der fehlenden Lehrperson
+        # nicht verhindern. Auch Zeile 2 darf nicht übernommen werden.
+        self.blatt["C4"] = 0.25
+        self.blatt["E4"] = None
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        for fundstelle in ["C4:", "E4:"]:
+            self.assertTrue(
+                any(meldung.startswith(fundstelle) for meldung in fehlerliste),
+                fehlerliste,
+            )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_speicherfehler_nimmt_alle_aenderungen_zurueck(self):
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        # wraps hält die echte Speichermethode fest. DEFAULT lässt den ersten
+        # Aufruf normal speichern: die Ergänzung zur vorhandenen Untersuchung.
+        # Beim zweiten Teilnahmeaufruf ist auch die neue Untersuchung angelegt.
+        # Erst dann löst der Test einen Fehler aus. So wird eine tatsächliche
+        # Rücknahme beider Änderungsarten geprüft.
+        with patch(
+            "vp_stunden.importe.Teilnahme.objects.create",
+            wraps=Teilnahme.objects.create,
+            side_effect=[DEFAULT, DatabaseError("INTERNER_TESTFEHLER")],
+        ) as teilnahmespeicherung:
+            fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertEqual(teilnahmespeicherung.call_count, 2)
+        self.assertEqual(
+            fehlerliste,
+            ["Datei: Der Übergangsimport konnte nicht übernommen werden."],
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+
+class RegulaererImportTests(TestCase):
+    """Prüft Datenübernahme und vollständige Abweisung beim regulären Import."""
+
+    def setUp(self):
+        # Jeder Test beginnt mit demselben synthetischen Altbestand.
+        # Untersuchung und Teilnahme liegen in der gesonderten Testdatenbank.
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+
+        # Vollständige Feldwerte sofort festhalten. So werden später auch
+        # unbeabsichtigte Änderungen erkannt, bei denen die Anzahl gleich bleibt.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        # Die Arbeitsmappe entsteht im Arbeitsspeicher.
+        # addCleanup sorgt nach dem Test für das Schließen der Arbeitsmappe.
+        self.arbeitsmappe = Workbook()
+        self.addCleanup(self.arbeitsmappe.close)
+        self.blatt = self.arbeitsmappe.active
+        self.blatt.title = "Untersuchung"
+
+        self.blatt["A1"] = "Studienname"
+        self.blatt["A2"] = "Stundenwert (VP-Stunden)"
+        self.blatt["A3"] = "Einordnung (P/O)"
+        self.blatt["A4"] = "Verantwortliche Lehrperson"
+        self.blatt["A6"] = "Matrikelnummer"
+
+        self.blatt["B1"] = "  Neue Studie  "
+        self.blatt["B2"] = 2.5
+        self.blatt["B3"] = Untersuchung.ONLINE
+        self.blatt["B4"] = "  Testlehrperson Neu  "
+
+        # Zahlen in Excel eintragen. Erst der Import wandelt sie für
+        # die Speicherung in Zeichenfolgen um. Die Lücke darf ihn nicht stoppen.
+        self.blatt["A7"] = 1234567
+        self.blatt["A106"] = 7654321
+
+    def test_fa10_untersuchung_und_teilnahmen_werden_gespeichert(self):
+        # Die Arbeitsmappe als XLSX-Bytes schreiben und als Speicherupload
+        # bereitstellen. Es wird keine Datei auf der Festplatte angelegt.
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        beginn = timezone.now()
+        fehlerliste = importiere_untersuchung(datei)
+        ende = timezone.now()
+
+        self.assertEqual(fehlerliste, [])
+
+        neue_untersuchung = Untersuchung.objects.get(
+            studienname_vergleich="neue studie"
+        )
+        self.assertEqual(
+            (
+                neue_untersuchung.studienname,
+                neue_untersuchung.stundenwert,
+                neue_untersuchung.einordnung,
+                neue_untersuchung.lehrperson,
+            ),
+            ("Neue Studie", 2.5, Untersuchung.ONLINE, "Testlehrperson Neu"),
+        )
+        self.assertGreaterEqual(neue_untersuchung.uploadzeitpunkt, beginn)
+        self.assertLessEqual(neue_untersuchung.uploadzeitpunkt, ende)
+
+        # Außer der neuen Untersuchung muss der alte Bestand vollständig
+        # unverändert bleiben, einschließlich seines Uploadzeitpunkts.
+        self.assertEqual(
+            list(
+                Untersuchung.objects.exclude(
+                    pk=neue_untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            self.untersuchungsbestand,
+        )
+
+        # Genau die beiden Nummern müssen derselben neuen Untersuchung
+        # zugeordnet sein. A106 muss trotz der vorherigen Lücke übernommen werden.
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    untersuchung=neue_untersuchung
+                ).order_by("pk").values_list("matrikelnummer", flat=True)
+            ),
+            ["1234567", "7654321"],
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    untersuchung=neue_untersuchung
+                ).order_by("pk").values()
+            ),
+            self.teilnahmebestand,
+        )
+
+    def test_fa08_doppelte_matrikelnummer_wird_abgewiesen(self):
+        self.blatt["A106"] = 1234567
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        # Mindestens eine Meldung muss die verursachende Zelle nennen.
+        self.assertTrue(
+            any(meldung.startswith("A106:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa08_bereits_gespeicherte_untersuchung_wird_abgewiesen(self):
+        # Äußere Leerzeichen und andere Großschreibung dürfen den
+        # Bestandskonflikt nicht verdecken. Regulär wird nichts ergänzt.
+        self.blatt["B1"] = "  BESTANDSSTUDIE  "
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        self.assertTrue(
+            any(meldung.startswith("B1:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa09_unabhaengige_zellfehler_werden_gesammelt(self):
+        # Die einzelnen Feldprüfungen haben bereits eigene Tests.
+        # Hier wird geprüft, ob der Import sie einbindet und ihre Fehler
+        # unabhängig sammelt, auch wenn schon der Studienname ungültig ist.
+        self.blatt["B1"] = "   "
+        self.blatt["B2"] = 0.25
+        self.blatt["B3"] = "p"
+        self.blatt["B4"] = None
+        self.blatt["A106"] = "7654321"
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        for fundstelle in ["B1:", "B2:", "B3:", "B4:", "A106:"]:
+            self.assertTrue(
+                any(meldung.startswith(fundstelle) for meldung in fehlerliste),
+                fehlerliste,
+            )
+
+        # Auch die weiterhin gültige Nummer in A7 darf nicht gespeichert werden.
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa06_ohne_matrikelnummer_wird_datei_abgewiesen(self):
+        self.blatt["A7"] = None
+        self.blatt["A106"] = None
+
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        self.assertTrue(
+            any(meldung.startswith("A7:A106:") for meldung in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa09_speicherfehler_nimmt_alle_aenderungen_zurueck(self):
+        with BytesIO() as puffer:
+            self.arbeitsmappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+
+        # wraps hält die echte Speichermethode fest. DEFAULT lässt den ersten
+        # Teilnahmeaufruf tatsächlich speichern. Erst der zweite scheitert.
+        # Dann müssen sowohl die Untersuchung als auch die erste Teilnahme
+        # durch die gemeinsame Transaktion zurückgenommen werden.
+        with patch(
+            "vp_stunden.importe.Teilnahme.objects.create",
+            wraps=Teilnahme.objects.create,
+            side_effect=[DEFAULT, DatabaseError("INTERNER_TESTFEHLER")],
+        ) as teilnahmespeicherung:
+            fehlerliste = importiere_untersuchung(datei)
+
+        self.assertEqual(teilnahmespeicherung.call_count, 2)
+        self.assertEqual(
+            fehlerliste,
+            ["Datei: Der Import konnte nicht übernommen werden."],
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )

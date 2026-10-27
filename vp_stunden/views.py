@@ -1,8 +1,10 @@
 from django.shortcuts import render
-from django.http import HttpRequest, JsonResponse
+from django.http import HttpRequest,HttpResponse, JsonResponse
 
 from vp_stunden.sicherheit import melde_an, melde_ab, aendere_passwort, pruefe_zugriff, lege_konto_an, setze_passwort_zurueck
 from vp_stunden.models import Benutzerkonto
+from vp_stunden.vp_daten import loesche_teilnahmedaten,suche_teilnahmen, berechne_stunden, suche_untersuchungen, korrigiere_untersuchung
+from vp_stunden.reports import erzeuge_report
 
 def melde_an_view(anfrage: HttpRequest) -> JsonResponse:
     """
@@ -328,3 +330,456 @@ def setze_passwort_zurueck_view(anfrage: HttpRequest) -> JsonResponse:
                 'nachricht': 'Passwortzurücksetzung erfolgreich.'
             }
         )
+
+
+def loesche_teilnahmedaten_view(anfrage: HttpRequest) -> JsonResponse:
+    """
+    Verarbeitet die HTTP-Anfrage zum Löschen von Teilnahmedaten.
+
+    :param anfrage: Die HTTP-Anfrage mit der Matrikelnummer und der Bestätigung der externen Ablage.
+    :return: Eine JSON-Antwort zum Ergebnis der Löschung.
+
+    1. Überprüft, ob die HTTP-Methode der Anfrage POST ist.
+    2. Wenn die Methode nicht POST ist, gibt eine JSON-Antwort mit einem Fehlerstatus und einer entsprechenden Nachricht zurück.
+    3. Extrahiert die Matrikelnummer und die Bestätigung der externen Ablage aus der Anfrage.
+    4. Überprüft, ob alle erforderlichen Daten vorhanden sind.
+    5. Prüft den Zugriff für Administratoren.
+    6. Ruft die Funktion loesche_teilnahmedaten() auf, um die Teilnahmedaten zu löschen.
+    7. Gibt eine JSON-Antwort zurück, die den Erfolg oder Misserfolg der Löschung angibt.
+    8. Bei Fehlern werden die entsprechenden Fehlermeldungen in der JSON-Antwort zurückgegeben.
+    9. Bei erfolgreicher Löschung wird eine Bestätigung in der JSON-Antwort zurückgegeben.
+    10. Die Funktion stellt sicher, dass nur Administratoren Teilnahmedaten löschen können.
+    """
+
+    # Löschungen ausschließlich über die HTTP-Methode POST zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Extrahiere die Matrikelnummer und die Bestätigung der externen Ablage aus der Http-Anfrage
+    matrikelnummer = anfrage.POST.get('matrikelnummer')
+    ablage_bestaetigt = anfrage.POST.get('ablage_bestaetigt') == 'true'
+
+    # Überprüfe, ob alle erforderlichen Daten vorhanden sind
+    if not matrikelnummer:
+        return JsonResponse({'erfolg': False, 'nachricht': 'Ungültige Angaben.'}, status=400)
+
+    # Den Zugriff nur für Administratoren zulassen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Rufe die Funktion zum Löschen der Teilnahmedaten auf
+    fehlerliste = loesche_teilnahmedaten(matrikelnummer, ablage_bestaetigt)
+
+    if fehlerliste:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Löschung fehlgeschlagen.',
+                'fehlerliste': fehlerliste  # Liste der Fehler zurückgeben
+            },
+            status=400  # HTTP-Statuscode: Die Anfrage wurde wegen fehlerhafter Angaben abgewiesen
+        )
+    else:
+        return JsonResponse(
+            {
+                'erfolg': True,
+                'nachricht': 'Löschung erfolgreich.'
+            }
+        )
+
+
+def suche_teilnahmen_view(anfrage: HttpRequest) -> JsonResponse:
+    """
+    Verarbeitet die HTTP-Anfrage zur Suche von Teilnahmedaten.
+
+    :param anfrage: Die HTTP-Anfrage mit der Matrikelnummer.
+    :return: Eine JSON-Antwort mit den gefundenen Teilnahmedaten oder einer Fehlermeldung.
+
+    """
+
+
+    # Suchen ausschließlich über die HTTP-Methode POST zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Extrahiere die Matrikelnummer aus der Http-Anfrage
+    matrikelnummer = anfrage.POST.get('matrikelnummer')
+
+    # Überprüfe, ob die Matrikelnummer vorhanden ist
+    if not matrikelnummer:
+        return JsonResponse({'erfolg': False, 'nachricht': 'Ungültige Angaben.'}, status=400)
+
+    # Den Zugriff nur für Administratoren zulassen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Rufe die Funktion zum Suchen der Teilnahmedaten auf
+    teilnahmen = suche_teilnahmen(matrikelnummer)
+
+    if not teilnahmen:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Keine Teilnahmedaten gefunden.'
+            },
+            status=404  # HTTP-Statuscode: Die angeforderten Daten wurden nicht gefunden
+        )
+
+    # Berechne die Stundenwerte und den Erfüllungsstatus der gefundenen Teilnahmen
+    berechnung = berechne_stunden(teilnahmen)
+
+    # Bereite die Teilnahmedaten für die JSON-Antwort vor
+    teilnahmedaten = []
+
+    # Füge die Informationen jeder Teilnahme in die Liste der Teilnahmedaten ein
+    for teilnahme in teilnahmen:
+        untersuchung = teilnahme.untersuchung
+        teilnahmedaten.append({
+            'matrikelnummer': teilnahme.matrikelnummer,
+            'studienname' : untersuchung.studienname,
+            'stundenwert': untersuchung.stundenwert,
+            'einordnung': untersuchung.einordnung,
+            'lehrperson': untersuchung.lehrperson,
+            'uploadzeitpunkt' : untersuchung.uploadzeitpunkt
+        })
+
+    # Bereite die JSON-Antwort mit den Teilnahmedaten und der Berechnung vor
+    return JsonResponse(
+        {
+            'erfolg': True,
+            'nachricht': 'Teilnahmedaten erfolgreich gefunden.',
+            'teilnahmen': teilnahmedaten,
+            'berechnung': berechnung,
+        }
+    )
+
+
+def suche_untersuchungen_view(anfrage: HttpRequest) -> JsonResponse:
+    '''
+    Durchsucht die Untersuchungen nach dem gegebenen Suchtext.
+
+    :param anfrage: Die HTTP-Anfrage mit dem Suchtext.
+    :return: Eine JSON-Antwort mit den gefundenen Untersuchungen oder einer Fehlermeldung.
+
+    1. Überprüft, ob die HTTP-Methode der Anfrage POST ist.
+    2. Wenn die Methode nicht POST ist, gibt eine JSON-Antwort mit einem Fehlerstatus und einer entsprechenden Nachricht zurück.
+    3. Prüft den Zugriff für Administratoren.
+    4. Extrahiert den Suchtext aus der Anfrage.
+    5. Überprüft, ob der Suchtext vorhanden ist.
+    6. Ruft die Funktion suche_untersuchungen() auf, um die Untersuchungen zu durchsuchen.
+    7. Gibt eine JSON-Antwort zurück, die den Erfolg oder Misserfolg der Suche angibt.
+    8. Bei Fehlern werden die entsprechenden Fehlermeldungen in der JSON-Antwort zurückgegeben.
+    9. Bei erfolgreicher Suche werden die gefundenen Untersuchungen in der JSON-Antwort zurückgegeben.
+    '''
+
+    # Suchen ausschließlich über die HTTP-Methode POST zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Nur Administratoren dürfen Untersuchungen durchsuchen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Extrahiere den Suchtext aus der Http-Anfrage
+    # get(...) liefert einen Text oder None, wenn der Schlüssel fehlt. is None weist deshalb ausschließlich den fehlenden Parameter ab.
+    suchtext = anfrage.POST.get('suchtext')
+
+    # Einen fehlenden Suchparameter abweisen
+    if suchtext is None:
+        return JsonResponse(
+            {'erfolg': False, 'nachricht': 'Ungültige Angaben.'},
+            status=400
+        )
+
+    # Die passenden Untersuchungen laden
+    untersuchungen = suche_untersuchungen(suchtext)
+
+    # Keinen Treffer gefunden
+    if not untersuchungen:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Keine Untersuchungen gefunden.'
+            },
+            status=404  # HTTP-Statuscode: Die angeforderten Daten wurden nicht gefunden
+        )
+
+    # Die Untersuchungen für die JSON-Antwort vorbereiten
+    untersuchungsdaten = []
+    for untersuchung in untersuchungen:
+        untersuchungsdaten.append({
+            'untersuchung_id': untersuchung.pk,  # Primärschlüssel der Untersuchung hinzufügen
+            'studienname': untersuchung.studienname,
+            'stundenwert': untersuchung.stundenwert,
+            'einordnung': untersuchung.einordnung,
+            'lehrperson': untersuchung.lehrperson,
+            'uploadzeitpunkt': untersuchung.uploadzeitpunkt.isoformat()  # Zeitpunkte in ISO-Format umwandeln
+        })
+
+    # Die JSON-Antwort mit den Untersuchungsdaten zurückgeben
+    return JsonResponse(
+        {
+            'erfolg': True,
+            'nachricht': 'Untersuchungen erfolgreich gefunden.',
+            'untersuchungen': untersuchungsdaten,
+        }
+    )
+
+def korrigiere_untersuchung_view(anfrage: HttpRequest) -> JsonResponse:
+    '''
+    Korrigiert eine bestehende Untersuchung.
+
+    :param anfrage: Die HTTP-Anfrage mit den Korrekturdaten.
+    :return: Eine JSON-Antwort zum Ergebnis der Korrektur.
+
+    '''
+
+    # Korrekturen ausschließlich über die HTTP-Methode POST zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Nur Administratoren dürfen Untersuchungen korrigieren
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Extrahiere die Korrekturdaten aus der Http-Anfrage
+    untersuchung_id = anfrage.POST.get('untersuchung_id')
+    studienname = anfrage.POST.get('studienname')
+    stundenwert = anfrage.POST.get('stundenwert')
+    einordnung = anfrage.POST.get('einordnung')
+    lehrperson = anfrage.POST.get('lehrperson')
+
+    # Fehlende Parameter mit ihrer Feldbezeichnung melden.
+    for feldname, wert in [
+        ("Untersuchung", untersuchung_id),
+        ("Studienname", studienname),
+        ("Stundenwert", stundenwert),
+        ("Einordnung", einordnung),
+        ("Lehrperson", lehrperson),
+    ]:
+        if wert is None:
+            return JsonResponse(
+                {
+                    'erfolg': False,
+                    'nachricht': 'Ungültige Angaben.',
+                    'fehlerliste': [f"{feldname}: Die Angabe fehlt."],
+                },
+                status=400,
+            )
+
+     # Den internen Untersuchungsschlüssel als Ganzzahl vorbereiten.
+    try:
+        untersuchung_id = int(untersuchung_id)
+    except ValueError:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Ungültige Angaben.',
+                'fehlerliste': [
+                    'Untersuchung: Der Schlüssel muss eine ganze Zahl sein.'
+                ],
+            },
+            status=400,
+        )
+
+    # Den Stundenwert als Fließkommazahl vorbereiten.
+    try:
+        stundenwert = float(stundenwert)
+    except ValueError:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Ungültige Angaben.',
+                'fehlerliste': ['Stundenwert: Eine Zahl ist erforderlich.'],
+            },
+            status=400,
+        )
+
+    # Die vorbereiteten Angaben prüfen und gemeinsam speichern.
+    untersuchung, fehlerliste = korrigiere_untersuchung(
+        untersuchung_id=untersuchung_id,
+        studienname=studienname,
+        stundenwert=stundenwert,
+        einordnung=einordnung,
+        lehrperson=lehrperson,
+    )
+
+    # Feldbezogene Fehlermeldungen an die Oberfläche weitergeben.
+    if fehlerliste:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Untersuchungskorrektur fehlgeschlagen.',
+                'fehlerliste': fehlerliste,
+            },
+            status=400,
+        )
+
+    # Die gespeicherten Untersuchungsangaben für die Tabellenanzeige liefern.
+    return JsonResponse(
+        {
+            'erfolg': True,
+            'nachricht': 'Untersuchung erfolgreich korrigiert.',
+            'untersuchung': {
+                'untersuchung_id': untersuchung.pk,
+                'studienname': untersuchung.studienname,
+                'stundenwert': untersuchung.stundenwert,
+                'einordnung': untersuchung.einordnung,
+                'lehrperson': untersuchung.lehrperson,
+                'uploadzeitpunkt': untersuchung.uploadzeitpunkt.isoformat(),
+            },
+        }
+    )
+
+
+def erzeuge_report_view(anfrage: HttpRequest) -> HttpResponse:
+    """
+    Verarbeitet die administrative PDF-Reportanfrage für eine Matrikelnummer.
+
+    :param anfrage: Die HTTP-Anfrage mit der Matrikelnummer.
+    :return: Eine PDF-Downloadantwort oder eine JSON-Fehlerantwort.
+
+
+    """
+
+    # Nur POST-Anfragen zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Den Zugriff nur für Administratoren zulassen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Matrikelnummer auslesen
+    matrikelnummer = anfrage.POST.get('matrikelnummer')
+
+    # Überprüfen, ob die Matrikelnummer vorhanden ist
+    if not matrikelnummer:
+        return JsonResponse({'erfolg': False, 'nachricht': 'Ungültige Angaben.'}, status=400)
+
+    #Teilnahmedaten laden
+    teilnahmen = suche_teilnahmen(matrikelnummer)
+
+    # Überprüfen, ob Teilnahmedaten gefunden wurden
+    if not teilnahmen:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Keine Teilnahmedaten gefunden.'
+            },
+            status=404  # HTTP-Statuscode: Die angeforderten Daten wurden nicht gefunden
+        )
+
+    # Berechnung der Stundenwerte und des Erfüllungsstatus der gefundenen Teilnahmen
+    berechnung = berechne_stunden(teilnahmen)
+
+    # Überprüfen, ob die Mindestvorgaben für einen Report erfüllt sind
+    if not berechnung["erfuellt"]:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Die Mindestvorgaben für einen Report sind nicht erfüllt.',
+            },
+            status=400,
+        )
+
+    # Die bereits geladenen Teilnahmen nach ihrer internen ID aufsteigend ordnen.
+    teilnahmen.sort(key=lambda teilnahme: teilnahme.pk)
+
+    # Den PDF-Inhalt aus denselben Teilnahmen und ihrer Berechnung erzeugen.
+    try:
+        pdf_inhalt = erzeuge_report(
+            matrikelnummer,
+            teilnahmen,
+            berechnung,
+        )
+    except Exception:
+        # Technische Erzeugungsfehler ohne interne Fehlerdetails beantworten.
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Der Report konnte nicht erzeugt werden.',
+            },
+            status=500,
+        )
+
+    # Die Matrikelnummer in den vorgeschlagenen Downloadnamen aufnehmen.
+    return HttpResponse(
+        pdf_inhalt,
+        content_type='application/pdf',
+        headers={
+            'Content-Disposition': (
+                f'attachment; filename="vp_stunden_{matrikelnummer}.pdf"'
+            ),
+        },
+    )
