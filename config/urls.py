@@ -43,4 +43,8 @@ urlpatterns = [
     path('untersuchung_korrigieren/', vp_stunden.views.korrigiere_untersuchung_view, name='korrigiere_untersuchung'),
     # Administrative Reportanfragen an die PDF-Reportview weiterleiten.
     path('report_erzeugen/', vp_stunden.views.erzeuge_report_view, name='erzeuge_report'),
+        # Reguläre Uploadanfragen an die Import-View weiterleiten.
+    path('untersuchung_importieren/', vp_stunden.views.importiere_untersuchung_view, name='importiere_untersuchung',),
+        # Administrative Übergangsimporte an die zuständige View weiterleiten.
+    path('uebergangsdatei_importieren/', vp_stunden.views.importiere_uebergangsdatei_view, name='importiere_uebergangsdatei',),
 ]

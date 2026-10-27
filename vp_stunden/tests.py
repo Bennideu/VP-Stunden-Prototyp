@@ -1,536 +1,493 @@
-# Anforderungsbezogene Tests für Passwörter, Benutzerkonten und Anmeldebegrenzung
+"""Anforderungsbezogene Tests für Konten, Sitzungen, VP-Daten und Importe."""
 
-from unittest.mock import DEFAULT, patch  # Einzelne Speicheraufrufe gezielt beeinflussen
-from datetime import datetime # datetime wandelt Strings in Zeitpunkte um und erzeugt Zeitpunkte für die Tests
-from django.db import DatabaseError, IntegrityError, transaction # Datenbankfehler erwarten und den Fehlversuch zurückrollen
-from django.contrib.auth.password_validation import validate_password  # Die konfigurierten Django-Passwortregeln prüfen
-from django.core.exceptions import ValidationError  # Ausnahme bei verletzten Validierungsregeln
-from django.http import HttpRequest  # HTTP-Anfrageobjekte für direkte Funktionstests erzeugen
-from django.test import SimpleTestCase  # Django-Testklasse ohne Datenbankzugriff
-from django.utils import timezone  # Zeitzonenbewusste Zeitpunkte und Zeitabstände verwenden
-from vp_stunden.models import Benutzerkonto, Untersuchung, Teilnahme  # Die benutzerdefinierten Modelle verwenden
-from django.contrib.auth.hashers import get_hasher  # Den konfigurierten Passwort-Hasher abrufen
-from django.test import TestCase  # Django-Testklasse für Tests mit Datenbankzugriff
-from django.contrib.auth import get_user  # Konto anhand der Sitzungsdaten ermitteln
-from vp_stunden.sicherheit import lege_konto_an, melde_an, melde_ab, pruefe_zugriff, setze_passwort_zurueck, aendere_passwort  # Zu prüfende Funktionen für Kontenanlage, Anmeldung, Abmeldung und Zugriffskontrolle
-from django.contrib.sessions.backends.db import SessionStore
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import DEFAULT, patch
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
+
+from defusedxml.ElementTree import fromstring as geschuetztes_xml
+from defusedxml.common import EntitiesForbidden
+
+from django.conf import settings
 from django.contrib.auth import SESSION_KEY, get_user
-from django.db import IntegrityError, transaction  # Datenbankfehler erwarten und den Fehlversuch zurückrollen
-from vp_stunden.vp_daten import pruefe_einordnung, pruefe_matrikelnummer, pruefe_lehrperson, pruefe_studienname, pruefe_stundenwert, berechne_stunden, suche_teilnahmen, suche_untersuchungen, korrigiere_untersuchung, loesche_teilnahmedaten  # Die Einordnungsvalidierung für Untersuchungen prüfen
-from vp_stunden.reports import erzeuge_report  # Die Reportgenerierung prüfen
+from django.contrib.auth.hashers import get_hasher
+from django.contrib.auth.password_validation import validate_password
+from django.contrib.sessions.backends.db import SessionStore
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile, TemporaryUploadedFile
+from django.db import DatabaseError, IntegrityError, transaction
+from django.http import HttpRequest
+from django.middleware.csrf import get_token
+from django.test import Client, SimpleTestCase, TestCase
+from django.utils import timezone
+from openpyxl import Workbook, load_workbook
+from openpyxl.packaging.relationship import Relationship
+from openpyxl.workbook.external_link.external import (
+    ExternalBook,
+    ExternalLink,
+    ExternalSheetNames,
+)
+from openpyxl.writer.excel import ExcelWriter
+from openpyxl.xml.constants import CONTYPES_NS, PKG_REL_NS, VBA, XLSM, XLSX, XLTM
+
+from vp_stunden.models import Benutzerkonto, Untersuchung, Teilnahme
+from vp_stunden.sicherheit import (
+    aendere_passwort,
+    lege_konto_an,
+    melde_ab,
+    melde_an,
+    pruefe_zugriff,
+    setze_passwort_zurueck,
+)
+from vp_stunden.vp_daten import (
+    berechne_stunden,
+    korrigiere_untersuchung,
+    loesche_teilnahmedaten,
+    pruefe_einordnung,
+    pruefe_lehrperson,
+    pruefe_matrikelnummer,
+    pruefe_studienname,
+    pruefe_stundenwert,
+    suche_teilnahmen,
+    suche_untersuchungen,
+)
+from vp_stunden.reports import erzeuge_report
 from vp_stunden.views import melde_an_view
-from io import BytesIO  # XLSX-Dateien vollständig im Arbeitsspeicher erzeugen
-from django.core.files.uploadedfile import SimpleUploadedFile  # Einen Speicherupload bereitstellen
-from openpyxl import Workbook  # Eine Excel-Arbeitsmappe erzeugen
 from vp_stunden.importe import (
     importiere_uebergangsdatei,
     importiere_untersuchung,
-)# Passwortlängen und erlaubte Zeichenfolgen nach QA-01 prüfen
+)
+
+
 class PasswortregelnTests(SimpleTestCase):
+    """Prüft Mindestlänge und zulässige Passwortzeichen nach QA-01."""
 
-    # 14 Zeichen unterschreiten die Mindestlänge und müssen abgewiesen werden
     def test_qa01_14_zeichen_werden_abgewiesen(self):
+        """Ein Passwort unterhalb der Mindestlänge wird abgewiesen."""
         with self.assertRaises(ValidationError):
-            validate_password('a' * 14)  # Die Validierung muss eine Ausnahme auslösen
+            validate_password('a' * 14)
 
-
-    # Die Mindestlänge von 15 Zeichen muss akzeptiert werden
     def test_qa01_15_zeichen_werden_akzeptiert(self):
+        """Ein Passwort genau an der Mindestlänge wird akzeptiert."""
         self.assertIsNone(validate_password('a' * 15))
 
-
-    # Ein Passwort mit 64 Zeichen muss unterstützt werden
     def test_qa01_64_zeichen_werden_akzeptiert(self):
+        """Ein Passwort mit 64 Zeichen bleibt zulässig."""
         self.assertIsNone(validate_password('a' * 64))
 
-
-    # Auch 65 Zeichen werden ohne zusätzliche 64-Zeichen-Obergrenze akzeptiert
     def test_qa01_65_zeichen_werden_akzeptiert(self):
+        """Es gilt keine zusätzliche Obergrenze von 64 Zeichen."""
         self.assertIsNone(validate_password('a' * 65))
 
-
-    # Ein ausreichend langes Zahlenpasswort muss ohne Zeichenklassenregeln akzeptiert werden
     def test_qa01_reines_zahlenpasswort_wird_akzeptiert(self):
+        """Ausreichend lange Zahlenpasswörter brauchen keine weiteren Zeichenklassen."""
         self.assertIsNone(validate_password('123456789012345'))
 
 
-
-# Hashvergleich, Argon2id-Parameter und individuellen Salt prüfen
 class PasswortHashingTests(SimpleTestCase):
+    """Prüft Passwortvergleich, Argon2id-Parameter und individuelle Salts."""
 
-
-    # Richtiges und falsches Passwort, Hashparameter und unterschiedliche Salts prüfen
     def test_qa01_passwortvergleich(self):
-        # Synthetische Testwerte vorbereiten
+        """Passwortvergleich, Hashparameter und neuer Salt erfüllen das gewählte Profil."""
         testpasswort = 'a' * 64
         konto = Benutzerkonto(username='testuser', rolle=Benutzerkonto.LEHRPERSON)
-        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
+        konto.set_password(testpasswort)
         self.assertNotEqual(konto.password, testpasswort)
-        self.assertTrue(konto.check_password(testpasswort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
-
+        self.assertTrue(konto.check_password(testpasswort))
 
         testpasswort_falsch = 'a' * 63 + 'b'
-        self.assertFalse(konto.check_password(testpasswort_falsch))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
+        self.assertFalse(konto.check_password(testpasswort_falsch))
 
+        hasher = get_hasher()
+        # decode liest Algorithmus und Parameter aus dem Hash, ohne das Passwort wiederherzustellen.
+        hasher_decoded = hasher.decode(konto.password)
+        self.assertEqual(hasher_decoded['algorithm'], 'argon2')
+        self.assertEqual(hasher_decoded['time_cost'], 2)
+        self.assertEqual(hasher_decoded['memory_cost'], 102400)
+        self.assertEqual(hasher_decoded['parallelism'], 8)
+        self.assertEqual(hasher_decoded['variety'], 'argon2id')
 
-        # Den konfigurierten Standard-Hasher und seine Parameter prüfen
-        hasher = get_hasher()  # Hasher-Objekt abrufen
-        hasher_decoded = hasher.decode(konto.password)  # Algorithmus, Parameter und Salt aus dem kodierten Hash auslesen
-        self.assertEqual(hasher_decoded['algorithm'], 'argon2')  # Den konfigurierten Hashalgorithmus prüfen
-        self.assertEqual(hasher_decoded['time_cost'], 2)  # Die Anzahl der Iterationen prüfen
-        self.assertEqual(hasher_decoded['memory_cost'], 102400)  # Den Speicherparameter in KiB prüfen
-        self.assertEqual(hasher_decoded['parallelism'], 8)  # Den Parallelitätsparameter prüfen
-        self.assertEqual(hasher_decoded['variety'], 'argon2id')  # Argon2id als verwendete Variante prüfen
+        konto.set_password(testpasswort)
+        # Gleiches Passwort erneut hashen: Ein neuer Salt muss den gespeicherten Wert verändern.
+        hasher_decoded_neu = hasher.decode(konto.password)
 
-
-        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
-        hasher_decoded_neu = hasher.decode(konto.password)  # Algorithmus, Parameter und Salt aus dem kodierten Hash auslesen
-        # Beim erneuten Hashen desselben Passworts müssen sich die Salts unterscheiden
         self.assertNotEqual(hasher_decoded['salt'], hasher_decoded_neu['salt'])
 
 
-
-# Die Speicherung des Passwort-Hashes in der Datenbank prüfen
 class PasswortspeicherungTests(TestCase):
+    """Prüft die unveränderte Speicherung des Passwort-Hashes."""
 
-
-    # Den gespeicherten Hash erneut aus der Datenbank laden und vergleichen
     def test_qa01_hash_wird_gespeichert(self):
-        # Synthetische Testwerte vorbereiten
+        """Der erneut geladene Hash entspricht dem gespeicherten Wert und akzeptiert das Passwort."""
         testpasswort = 'a' * 64
         konto = Benutzerkonto(username='testuser', rolle=Benutzerkonto.LEHRPERSON)
-        konto.set_password(testpasswort)  # Passwort hashen und den kodierten Hash am Kontoobjekt setzen
+        konto.set_password(testpasswort)
         passwort_hash = konto.password
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
-        # Das gespeicherte Konto erneut aus der Datenbank laden
+        konto.save()
+
+        # Erneut laden, damit die Assertions die Datenbankpersistenz nachweisen.
         konto_aus_db = Benutzerkonto.objects.get(username='testuser')
         self.assertEqual(konto_aus_db.password, passwort_hash)
         self.assertFalse(konto_aus_db.password == testpasswort)
-        self.assertTrue(konto_aus_db.check_password(testpasswort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
+        self.assertTrue(konto_aus_db.check_password(testpasswort))
 
 
-
-# Kontenanlage und Abweisung ungültiger Eingaben nach FA-02 und QA-01 prüfen
 class KontoErstellungTests(TestCase):
+    """Prüft Kontenanlage und kontrollierte Abweisung ungültiger Eingaben."""
 
+    def setUp(self):
+        """Bereitet gültige Eingaben vor, ohne das zu prüfende Konto anzulegen."""
+        self.benutzername = 'testnutzer'
+        self.passwort = 'a' * 64
+        self.rolle = Benutzerkonto.LEHRPERSON
 
-    # Ein zu kurzes Passwort muss ohne Kontospeicherung abgewiesen werden
     def test_qa01_kurzes_passwort_verhindert_kontoerstellung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 14
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Ein zu kurzes Passwort verhindert jede Kontospeicherung."""
+        self.passwort = 'a' * 14
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNone(konto)
-        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
-        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
+        self.assertTrue(fehlerliste)
+        self.assertFalse(Benutzerkonto.objects.filter(username=self.benutzername).exists())
 
-
-    # Kontenanlage sowie gespeicherten Benutzernamen, Rolle und Passwort-Hash prüfen
     def test_fa02_erfolgreiche_kontoerstellung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Das Konto speichert Benutzername, Rolle und prüfbaren Passwort-Hash."""
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        self.assertTrue(Benutzerkonto.objects.filter(username=benutzername).exists())
+        self.assertFalse(fehlerliste)
+        self.assertTrue(Benutzerkonto.objects.filter(username=self.benutzername).exists())
 
-        # Das gespeicherte Konto erneut aus der Datenbank laden
-        benutzerkonto_aus_db = Benutzerkonto.objects.get(username=benutzername)
-        self.assertTrue(benutzerkonto_aus_db.check_password(passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
-        self.assertEqual(benutzerkonto_aus_db.rolle, rolle)
-        self.assertNotEqual(benutzerkonto_aus_db.password, passwort)
-        self.assertEqual(benutzerkonto_aus_db.username, benutzername)
+        # Erneut laden, damit die Assertions die Datenbankpersistenz nachweisen.
+        benutzerkonto_aus_db = Benutzerkonto.objects.get(username=self.benutzername)
+        self.assertTrue(benutzerkonto_aus_db.check_password(self.passwort))
+        self.assertEqual(benutzerkonto_aus_db.rolle, self.rolle)
+        self.assertNotEqual(benutzerkonto_aus_db.password, self.passwort)
+        self.assertEqual(benutzerkonto_aus_db.username, self.benutzername)
 
-
-
-    # Eine unzulässige Rolle muss ohne Kontospeicherung abgewiesen werden
     def test_fa02_ungueltige_rolle_verhindert_kontoerstellung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = 'ungültig'
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Eine unzulässige Rolle wird ohne Kontospeicherung abgewiesen."""
+        self.rolle = 'ungültig'
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNone(konto)
-        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
-        self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
+        self.assertTrue(fehlerliste)
+        self.assertFalse(Benutzerkonto.objects.filter(username=self.benutzername).exists())
 
-    # Zwei aufeinanderfolgende Anlageversuche dürfen nur ein Konto mit diesem Namen speichern
     def test_fa02_doppelte_benutzername_verhindert_kontoerstellung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Zwei aufeinanderfolgende Anlageversuche speichern denselben Namen nur einmal."""
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-
-        konto2, fehlerliste2 = lege_konto_an(benutzername, passwort, rolle)
+        konto2, fehlerliste2 = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNone(konto2)
-        self.assertTrue(fehlerliste2)  # Mindestens eine Fehlermeldung erwarten
-        self.assertTrue(Benutzerkonto.objects.filter(username=benutzername).count() == 1)
+        self.assertTrue(fehlerliste2)
+        self.assertTrue(Benutzerkonto.objects.filter(username=self.benutzername).count() == 1)
 
 
-# Passwortzurücksetzen und unveränderten Bestand bei Fehlern prüfen
 class PasswortZuruecksetzenTests(TestCase):
+    """Prüft Passwortzurücksetzen und den Bestandserhalt bei Fehlern."""
 
+    def setUp(self):
+        """Bereitet Kontoeingaben vor und lässt den Fall ohne Konto weiterhin zu."""
+        self.benutzername = 'testnutzer'
+        self.passwort = 'a' * 64
+        self.rolle = Benutzerkonto.LEHRPERSON
 
-    # Das neue Passwort muss nach dem Zurücksetzen gültig und das bisherige ungültig sein
     def test_fa02_passwort_zuruecksetzen(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Nach dem Zurücksetzen gilt nur das neue Passwort."""
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-
+        self.assertFalse(fehlerliste)
 
         neues_passwort = 'b' * 64
-        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
+
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto.pk, neues_passwort)
-        self.assertFalse(fehlerliste_zuruecksetzen)  # Eine leere Fehlerliste erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
-        self.assertTrue(konto.check_password(neues_passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
-        self.assertFalse(konto.check_password(passwort))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
+        self.assertFalse(fehlerliste_zuruecksetzen)
 
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
+        self.assertTrue(konto.check_password(neues_passwort))
+        self.assertFalse(konto.check_password(self.passwort))
 
-    # Ein zu kurzes neues Passwort muss den bisherigen gespeicherten Hash unverändert lassen
     def test_qa01_zu_kurzes_passwort_laesst_altes_passwort_unveraendert(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        """Ein zu kurzes neues Passwort lässt den gespeicherten Hash unverändert."""
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-
+        self.assertFalse(fehlerliste)
 
         zu_kurzes_passwort = 'c' * 14
+        # Den kodierten Hash vor der abgewiesenen Änderung als Vergleichswert sichern.
         passwort_hash_vorher = konto.password
-        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
+
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto.pk, zu_kurzes_passwort)
-        self.assertTrue(fehlerliste_zuruecksetzen)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(fehlerliste_zuruecksetzen)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.password, passwort_hash_vorher)
-        self.assertTrue(konto.check_password(passwort))  # Das erwartete Passwort muss beim Hashvergleich akzeptiert werden
-        self.assertFalse(konto.check_password(zu_kurzes_passwort))  # Das bisherige oder abweichende Passwort muss abgewiesen werden
+        self.assertTrue(konto.check_password(self.passwort))
+        self.assertFalse(konto.check_password(zu_kurzes_passwort))
 
-
-    # Das Zurücksetzen für eine nachweislich fehlende Konto-ID muss abgewiesen werden
     def test_fa02_nicht_vorhandenes_konto_wird_abgewiesen(self):
-
+        """Eine nachweislich fehlende Konto-ID wird kontrolliert abgewiesen."""
         konto_id = 1
         self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())
         neues_passwort = 'b' * 64
-        # Die Rücksetzfunktion mit den vorbereiteten Eingaben aufrufen
+
         fehlerliste_zuruecksetzen = setze_passwort_zurueck(konto_id, neues_passwort)
-        self.assertTrue(fehlerliste_zuruecksetzen)  # Mindestens eine Fehlermeldung erwarten
+        self.assertTrue(fehlerliste_zuruecksetzen)
         self.assertFalse(Benutzerkonto.objects.filter(pk=konto_id).exists())
 
 
-# Fehlversuchsschwelle, feste Zeitfenster, Sperren und Rücksetzregeln nach QA-02 prüfen
 class AnmeldeTests(TestCase):
+    """Prüft Fehlversuchsfenster, Sperren und deren Rücksetzung nach QA-02."""
 
-    # Eine aktive Sperre muss auch das richtige Passwort abweisen und ihr Ende beibehalten
+    def setUp(self):
+        """Bereitet gemeinsame Eingaben und eine noch sitzungslose Anfrage vor."""
+        self.benutzername = 'testnutzer'
+        self.rolle = Benutzerkonto.LEHRPERSON
+        self.anfrage = HttpRequest()
+
     def test_qa02_aktive_sperre_verhindert_anmeldung(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Eine aktive Sperre weist auch das richtige Passwort ohne Verlängerung ab."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-
-        # Eine bestehende aktive Sperre vorbereiten
         konto.gesperrt_bis = timezone.now() + timezone.timedelta(minutes=5)
         sperrende_vorher = konto.gesperrt_bis
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
+        # Die Sitzung für diesen direkten Aufruf wie bei einer Browseranfrage bereitstellen.
+        self.anfrage.session = self.client.session
 
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-        # Den Anmeldeversuch mit dem vorbereiteten Konto ausführen
-        fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+        fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort)
+        self.assertTrue(fehlerliste_anmeldung)
         self.assertIn("Anmeldung fehlgeschlagen", fehlerliste_anmeldung[0])
 
-        # Nach der Abweisung muss die Sitzung weiterhin unangemeldet sein
-        self.assertFalse(get_user(anfrage).is_authenticated)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
 
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
 
-    # Genau am Sperrende muss der gespeicherte Fehlversuchs- und Sperrzustand zurückgesetzt werden
     def test_qa02_sperrende_setzt_sperrzustand_zurueck(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Genau am Sperrende werden Zähler, Fensterbeginn und Sperre zurückgesetzt."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 5
         konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=10)
         konto.gesperrt_bis = testzeitpunkt
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
+        # Die Sitzung für diesen direkten Aufruf wie bei einer Browseranfrage bereitstellen.
+        self.anfrage.session = self.client.session
 
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort)
+        self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertIsNone(konto.gesperrt_bis)
         self.assertEqual(konto.fehlversuche, 0)
         self.assertIsNone(konto.fehlversuchszeitraum_beginn)
 
-
-    # Genau am Ende des 15-Minuten-Fensters muss die bisherige Zählung zurückgesetzt werden
     def test_qa02_fensterende_setzt_fehlversuche_zurueck(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Eine erfolgreiche Anmeldung am Fensterende setzt die alte Zählung zurück."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 3
         konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=15)
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
+        # Die Sitzung für diesen direkten Aufruf wie bei einer Browseranfrage bereitstellen.
+        self.anfrage.session = self.client.session
 
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort)
+        self.assertFalse(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 0)
         self.assertIsNone(konto.fehlversuchszeitraum_beginn)
         self.assertIsNone(konto.gesperrt_bis)
 
-    # Der fünfte Fehlversuch innerhalb des Fensters muss eine fünfminütige Sperre auslösen
     def test_qa02_fuenfter_fehlversuch_sperrt_fuenf_minuten(self):
-
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Der fünfte Fehlversuch im laufenden Fenster sperrt für fünf Minuten."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=1)
 
         konto.fehlversuche = 4
         konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, 'falsches_passwort')
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, 'falsches_passwort')
+        self.assertTrue(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche,5)
         self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher)
         self.assertEqual(testzeitpunkt + timezone.timedelta(minutes=5),konto.gesperrt_bis)
 
-
-    # Der vierte Fehlversuch muss gezählt werden und darf noch keine Sperre auslösen
     def test_qa02_vierter_fehlversuch_sperrt_nicht(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Der vierte Fehlversuch wird gezählt und löst noch keine Sperre aus."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 3
         konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=1)
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Die Sitzung für diesen direkten Aufruf wie bei einer Browseranfrage bereitstellen.
+        self.anfrage.session = self.client.session
+
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste = melde_an(anfrage, benutzername, passwort='falschesPW')
-        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
+            fehlerliste = melde_an(self.anfrage, self.benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste)
 
-        # Nach der Abweisung muss die Sitzung weiterhin unangemeldet sein
-        self.assertFalse(get_user(anfrage).is_authenticated)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
 
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche,4)
         self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt - timezone.timedelta(minutes=1))
         self.assertIsNone(konto.gesperrt_bis)
 
-
-    # Ein weiterer Versuch während der Sperre darf Zähler, Fensterbeginn und Sperrende nicht ändern
     def test_qa02_sechster_Versuch_verlaengert_sperre_nicht(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Weitere Versuche während einer Sperre ändern weder Zählung noch Sperrende."""
         passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 5
         konto.fehlversuchszeitraum_beginn = testzeitpunkt - timezone.timedelta(minutes=2)
         sperrende_vorher = testzeitpunkt + timezone.timedelta(minutes=4)
         konto.gesperrt_bis = sperrende_vorher
 
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste = melde_an(anfrage, benutzername, passwort='falschesPW')
-        self.assertTrue(fehlerliste)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+            fehlerliste = melde_an(self.anfrage, self.benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche,5)
         self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
         self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt - timezone.timedelta(minutes=2))
 
-
-    # Ein falsches Passwort genau am Fensterende muss als erster Versuch eines neuen Fensters zählen
     def test_qa02_fehlversuch_am_fensterende_beginnt_neues_fenster(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Ein Fehlversuch genau am Fensterende beginnt eine neue Zählung."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
+        self.assertFalse(fehlerliste)
+
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 4
         konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=15))
         konto.gesperrt_bis = None
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort='falschesPW')
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort='falschesPW')
+        self.assertTrue(fehlerliste_anmeldung)
 
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 1)
         self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
         self.assertIsNone(konto.gesperrt_bis)
 
-
-    # Eine Sekunde vor Fensterende müssen die vier bisherigen Fehlversuche noch zählen
     def test_qa02_fehlversuch_kurz_vor_fensterende_sperrt(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Eine Sekunde vor Fensterende zählt der fünfte Fehlversuch noch zur Sperrschwelle."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=14, seconds=59)
 
         konto.fehlversuche = 4
         konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
         konto.gesperrt_bis = None
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort= 'falschesPW')
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort= 'falschesPW')
 
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 5)
         self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher,)
         self.assertEqual(konto.gesperrt_bis,testzeitpunkt + timezone.timedelta(minutes=5))
 
-
-
-    # Eine Sekunde nach Fensterende muss ein neues Fenster mit einem Fehlversuch beginnen
     def test_qa02_fehlversuch_nach_fensterende_beginnt_neues_fenster(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Eine Sekunde nach Fensterende zählt der Fehlversuch als erster eines neuen Fensters."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 4
         konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=15, seconds=1))
         konto.gesperrt_bis = None
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort='falschesPW')
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort='falschesPW')
 
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 1)
         self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
         self.assertIsNone(konto.gesperrt_bis)
 
-    # Eine Sekunde vor Sperrende muss das richtige Passwort weiterhin abgewiesen werden
     def test_qa02_kurz_vor_sperrende_bleibt_konto_gesperrt(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Eine Sekunde vor Sperrende bleibt auch das richtige Passwort gesperrt."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         fensterbeginn_vorher = testzeitpunkt - timezone.timedelta(minutes=10)
         sperrende_vorher = testzeitpunkt + timezone.timedelta(seconds=1)
@@ -538,565 +495,473 @@ class AnmeldeTests(TestCase):
         konto.fehlversuche = 5
         konto.fehlversuchszeitraum_beginn = fensterbeginn_vorher
         konto.gesperrt_bis = sperrende_vorher
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort)
 
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 5)
         self.assertEqual(konto.fehlversuchszeitraum_beginn,fensterbeginn_vorher,)
         self.assertEqual(konto.gesperrt_bis, sperrende_vorher)
 
-    # Nach Sperrende muss ein falsches Passwort eine neue Zählung beginnen
     def test_qa02_fehlversuch_nach_sperrende_beginnt_neues_fenster(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Nach Sperrende beginnt ein falsches Passwort eine neue Zählung."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 5
         konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=10))
         konto.gesperrt_bis = testzeitpunkt - timezone.timedelta(seconds=1)
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort= 'falschesPW')
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort= 'falschesPW')
 
-        self.assertTrue(fehlerliste_anmeldung)  # Mindestens eine Fehlermeldung erwarten
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        self.assertTrue(fehlerliste_anmeldung)
+
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 1)
         self.assertEqual(konto.fehlversuchszeitraum_beginn, testzeitpunkt)
         self.assertIsNone(konto.gesperrt_bis)
 
-
-    # Ein richtiges Passwort muss die Zählung auch innerhalb eines noch laufenden Fensters zurücksetzen
     def test_qa02_richtiges_passwort_setzt_fehlversuche_zurueck(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
+        """Ein richtiges Passwort setzt Fehlversuche zurück und erzeugt gültige Sitzungswerte."""
         passwort = 'a' * 15
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, passwort, self.rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Prüfzeitpunkt und gespeicherten Ausgangszustand vorbereiten
         testzeitpunkt = timezone.now()
         konto.fehlversuche = 4
         konto.fehlversuchszeitraum_beginn = (testzeitpunkt - timezone.timedelta(minutes=1))
         konto.gesperrt_bis = None
-        konto.save()  # Den vorbereiteten Kontozustand in der Testdatenbank speichern
+        konto.save()
 
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Die Sitzung für diesen direkten Aufruf wie bei einer Browseranfrage bereitstellen.
+        self.anfrage.session = self.client.session
+
+        # Den Anmeldeversuch genau am vorbereiteten Prüfzeitpunkt ausführen.
         with patch('vp_stunden.sicherheit.timezone.now',return_value=testzeitpunkt,):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, passwort)
 
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste_anmeldung)
 
-        # Wiedererkennung des angemeldeten Kontos nach FA-01 prüfen
-        angemeldetes_konto = get_user(anfrage)
+        angemeldetes_konto = get_user(self.anfrage)
         self.assertTrue(angemeldetes_konto.is_authenticated)
         self.assertEqual(angemeldetes_konto.pk, konto.pk)
 
-        anfrage.session.save()
-        gespeicherte_sitzung = SessionStore(session_key=anfrage.session.session_key)
+        self.anfrage.session.save()
+        # Eine neue SessionStore-Instanz liest die tatsächlich gespeicherten Sitzungswerte.
+        gespeicherte_sitzung = SessionStore(session_key=self.anfrage.session.session_key)
 
         self.assertEqual(gespeicherte_sitzung['sitzungsbeginn'], testzeitpunkt.timestamp())
         self.assertEqual(gespeicherte_sitzung['letzte_aktivitaet'], testzeitpunkt.timestamp())
 
-        # Die Prüfungen auf den tatsächlich gespeicherten Datenbankzustand beziehen
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Den gespeicherten Kontozustand statt nur das geänderte Python-Objekt prüfen.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 0)
         self.assertIsNone(konto.fehlversuchszeitraum_beginn)
         self.assertIsNone(konto.gesperrt_bis)
 
 
 class AbmeldeTests(TestCase):
+    """Prüft die Ungültigkeit einer Sitzung nach der Abmeldung."""
+
     def test_qa03_abmeldung_macht_sitzung_ungueltig(self):
-        # Synthetische Testwerte vorbereiten
+        """Die Abmeldung entfernt Authentifizierung und gespeicherte Sitzungskennung."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
         anfrage = HttpRequest()
         anfrage.session = self.client.session
         fehlerliste = melde_an(anfrage, benutzername, passwort=passwort)
         self.assertFalse(fehlerliste)
         self.assertTrue(get_user(anfrage).is_authenticated)
 
-        # Die Sitzung speichern und die Sitzungskennung überprüfen
         anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
         alte_sitzungskennung = anfrage.session.session_key
         self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Abmeldung ausführen und die Sitzung auf Ungültigkeit prüfen
         melde_ab(anfrage)
         self.assertFalse(get_user(anfrage).is_authenticated)
         self.assertFalse(anfrage.session.exists(alte_sitzungskennung))
 
 
 class ZugriffsTests(TestCase):
+    """Prüft Rollenfreigabe, Sitzungsangaben und beide Sitzungsfristen."""
 
-    # Zugriff auf ein Konto muss ohne Anmeldung verweigert werden
+    def setUp(self):
+        """Bereitet Eingaben und eine unangemeldete Anfrage mit Sitzung vor."""
+        self.benutzername = 'testnutzer'
+        self.passwort = 'a' * 64
+        # Direkte Funktionsaufrufe umgehen die Middleware und brauchen diese Sitzung.
+        self.anfrage = HttpRequest()
+        self.anfrage.session = self.client.session
+
     def test_qa04_ohne_anmeldung_wird_zugriff_verweigert(self):
-        # Synthetische Testwerte vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-
-        # Die Zugriffsprüfung ausführen und die erwartete Fehlermeldung prüfen
-        fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.LEHRPERSON])
+        """Eine unangemeldete Anfrage erhält keinen geschützten Zugriff."""
+        fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.LEHRPERSON])
         self.assertTrue(fehlerliste)
-        self.assertFalse(get_user(anfrage).is_authenticated)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
 
-    # Zugriff auf ein Konto mit der richtigen Rolle muss gewährt werden
     def test_qa04_erlaubte_rolle_erhaelt_zugriff(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Die erlaubte Rolle erhält Zugriff und aktualisiert nur die letzte Aktivität."""
         rolle = Benutzerkonto.LEHRPERSON
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=5)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.LEHRPERSON])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.LEHRPERSON])
 
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        self.assertTrue(get_user(anfrage).is_authenticated)
+        self.assertFalse(fehlerliste)
+        self.assertTrue(get_user(self.anfrage).is_authenticated)
 
-        # Neue SessionStore Instanz laden, um die gespeicherte Sitzung zu prüfen
-        anfrage.session.save()
-        gespeicherte_sitzung = SessionStore(session_key=anfrage.session.session_key)
+        self.anfrage.session.save()
+        # Eine neue SessionStore-Instanz liest die tatsächlich gespeicherten Sitzungswerte.
+        gespeicherte_sitzung = SessionStore(session_key=self.anfrage.session.session_key)
         self.assertEqual(gespeicherte_sitzung['sitzungsbeginn'], testzeitpunkt.timestamp())
         self.assertEqual(gespeicherte_sitzung['letzte_aktivitaet'], zugriffszeitpunkt.timestamp())
 
-    # Zugriff auf ein Konto mit einer falschen Rolle muss verweigert werden
     def test_qa04_falsche_rolle_verweigert_zugriff(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Die falsche Rolle erhält keinen Zugriff und erneuert die Aktivitätszeit nicht."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=5)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.LEHRPERSON])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.LEHRPERSON])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertTrue(get_user(anfrage).is_authenticated)
+        self.assertTrue(fehlerliste)
+        self.assertTrue(get_user(self.anfrage).is_authenticated)
 
-        anfrage.session.save()
+        self.anfrage.session.save()
+        # Eine neue SessionStore-Instanz liest die tatsächlich gespeicherten Sitzungswerte.
         gespeicherte_sitzung = SessionStore(
-            session_key=anfrage.session.session_key
+            session_key=self.anfrage.session.session_key
         )
 
         self.assertEqual(gespeicherte_sitzung['sitzungsbeginn'], testzeitpunkt.timestamp())
         self.assertEqual(gespeicherte_sitzung['letzte_aktivitaet'], testzeitpunkt.timestamp())
 
-
     def test_qa03_fehlender_sitzungsbeginn_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Ein fehlender Sitzungsbeginn führt zur vollständigen Abmeldung."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=5)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        del anfrage.session['sitzungsbeginn']  # Sitzungsbeginn entfernen, um die Prüfung zu erzwingen
-        anfrage.session.save()  # Änderungen an der Sitzung speichern
+        # Eine unvollständige Sitzung simulieren, die sicher beendet werden muss.
+        del self.anfrage.session['sitzungsbeginn']
+        self.anfrage.session.save()
 
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
-
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
     def test_qa03_fehlende_letzte_aktivitaet_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Eine fehlende letzte Aktivität führt zur vollständigen Abmeldung."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=5)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        del anfrage.session['letzte_aktivitaet']  # Sitzungsbeginn entfernen, um die Prüfung zu erzwingen
-        anfrage.session.save()  # Änderungen an der Sitzung speichern
+        # Eine unvollständige Sitzung simulieren, die sicher beendet werden muss.
+        del self.anfrage.session['letzte_aktivitaet']
+        self.anfrage.session.save()
 
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
-    # Genau 30 Minuten Inaktivität muss die Sitzung beendet werden
     def test_qa03_genau_30_minuten_inaktivitaet_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Genau 30 Minuten Inaktivität beenden die Sitzung."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=30)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
-    # Genau 29 Minuten und 59 Sekunden Inaktivität muss die Sitzung weiterhin gültig sein
     def test_qa03_genau_29_minuten_59_sekunden_inaktivitaet_erlaubt_zugriff(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Eine Sekunde vor der Inaktivitätsgrenze bleibt die Sitzung nutzbar."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=29, seconds=59)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        self.assertTrue(get_user(anfrage).is_authenticated) # Die Sitzung muss weiterhin gültig sein
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung)) # Die Sitzung muss weiterhin gültig sein
+        self.assertFalse(fehlerliste)
+        self.assertTrue(get_user(self.anfrage).is_authenticated)
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die gespeicherte Sitzung prüfen, um sicherzustellen, dass die letzte Aktivität aktualisiert wurde
-        anfrage.session.save()
+        self.anfrage.session.save()
+        # Eine neue SessionStore-Instanz liest die tatsächlich gespeicherten Sitzungswerte.
         gespeicherte_sitzung = SessionStore(
-            session_key=anfrage.session.session_key
+            session_key=self.anfrage.session.session_key
         )
 
         self.assertEqual(gespeicherte_sitzung['sitzungsbeginn'], testzeitpunkt.timestamp())
         self.assertEqual(gespeicherte_sitzung['letzte_aktivitaet'], zugriffszeitpunkt.timestamp())
 
-    # Genau 30 Minuten und 1 Sekunde Inaktivität muss die Sitzung beendet werden
     def test_qa03_genau_30_minuten_1_sekunde_inaktivitaet_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Eine Sekunde nach der Inaktivitätsgrenze ist die Sitzung ungültig."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Testzeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(minutes=30, seconds=1)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
+        konto, fehlerliste_anmeldung = lege_konto_an(self.benutzername, self.passwort, rolle)
 
-        # Die Anmeldung ausführen und die Authentifizierung prüfen
-        konto, fehlerliste_anmeldung = lege_konto_an(benutzername, passwort, rolle)
-
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
-    # Genau 3 Stunden, 59 Minuten und 59 Sekunden Sitzungsdauer muss die Sitzung weiterhin gültig sein
     def test_qa03_genau_3_stunden_59_minuten_59_sekunden_sitzungsdauer_erlaubt_zugriff(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Eine Sekunde vor der absoluten Frist bleibt eine kürzlich aktive Sitzung nutzbar."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Anmeldezeitpunkt und den späteren Zugriffszeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(hours=3, minutes=59, seconds=59)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-
-        # Das Benutzerkonto anlegen
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, rolle)
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        # Eine letzte Aktivität fünf Minuten vor dem Zugriff simulieren
+        # Frische Aktivität schließt Inaktivität als Ursache für das Sitzungsende aus.
         aktivitaetszeitpunkt = zugriffszeitpunkt - timezone.timedelta(minutes=5)
-        anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
+        self.anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
 
-        # Die Sitzung speichern und ihre Existenz vor dem Zugriff prüfen
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        self.assertTrue(get_user(anfrage).is_authenticated)
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.assertFalse(fehlerliste)
+        self.assertTrue(get_user(self.anfrage).is_authenticated)
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Den festen Sitzungsbeginn und die aktualisierte letzte Aktivität prüfen
-        anfrage.session.save()
-        gespeicherte_sitzung = SessionStore(session_key=anfrage.session.session_key)
+        self.anfrage.session.save()
+        # Eine neue SessionStore-Instanz liest die tatsächlich gespeicherten Sitzungswerte.
+        gespeicherte_sitzung = SessionStore(session_key=self.anfrage.session.session_key)
         self.assertEqual(gespeicherte_sitzung['sitzungsbeginn'],testzeitpunkt.timestamp())
         self.assertEqual(gespeicherte_sitzung['letzte_aktivitaet'],zugriffszeitpunkt.timestamp())
 
     def test_qa03_genau_4_stunden_sitzungsdauer_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Genau vier Stunden nach Anmeldung endet auch eine kürzlich aktive Sitzung."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Anmeldezeitpunkt und den späteren Zugriffszeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(hours=4)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-
-        # Das Benutzerkonto anlegen
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, rolle)
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        # Eine letzte Aktivität fünf Minuten vor dem Zugriff simulieren
+        # Frische Aktivität schließt Inaktivität als Ursache für das Sitzungsende aus.
         aktivitaetszeitpunkt = zugriffszeitpunkt - timezone.timedelta(minutes=5)
-        anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
+        self.anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
 
-        # Die Sitzung speichern und ihre Existenz vor dem Zugriff prüfen
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
     def test_qa03_genau_4_stunden_1_sekunde_sitzungsdauer_beendet_sitzung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
+        """Eine Sekunde nach der absoluten Frist bleibt die Sitzung ungültig."""
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Den Anmeldezeitpunkt und den späteren Zugriffszeitpunkt festlegen
         testzeitpunkt = timezone.now()
         zugriffszeitpunkt = testzeitpunkt + timezone.timedelta(hours=4, seconds=1)
 
-        # HttpRequest-Objekt mit der Testsession vorbereiten
-        anfrage = HttpRequest()
-        anfrage.session = self.client.session
-
-        # Das Benutzerkonto anlegen
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        konto, fehlerliste = lege_konto_an(self.benutzername, self.passwort, rolle)
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die Anmeldung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Einen festen Sitzungsbeginn für die spätere Fristprüfung setzen.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=testzeitpunkt):
-            fehlerliste_anmeldung = melde_an(anfrage, benutzername, passwort)
+            fehlerliste_anmeldung = melde_an(self.anfrage, self.benutzername, self.passwort)
         self.assertFalse(fehlerliste_anmeldung)
 
-        # Eine letzte Aktivität fünf Minuten vor dem Zugriff simulieren
+        # Frische Aktivität schließt Inaktivität als Ursache für das Sitzungsende aus.
         aktivitaetszeitpunkt = zugriffszeitpunkt - timezone.timedelta(minutes=5)
-        anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
+        self.anfrage.session['letzte_aktivitaet'] = aktivitaetszeitpunkt.timestamp()
 
-        # Die Sitzung speichern und ihre Existenz vor dem Zugriff prüfen
-        anfrage.session.save()
-        alte_sitzungskennung = anfrage.session.session_key
-        self.assertTrue(anfrage.session.exists(alte_sitzungskennung))
+        self.anfrage.session.save()
+        # Die bisherige Kennung für die spätere Existenzprüfung festhalten.
+        alte_sitzungskennung = self.anfrage.session.session_key
+        self.assertTrue(self.anfrage.session.exists(alte_sitzungskennung))
 
-        # Die Zugriffsprüfung mit einem festgelegten Prüfzeitpunkt ausführen
+        # Den späteren Zugriff gezielt simulieren, ohne im Test zu warten.
         with patch('vp_stunden.sicherheit.timezone.now', return_value=zugriffszeitpunkt):
-            fehlerliste = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+            fehlerliste = pruefe_zugriff(self.anfrage, [Benutzerkonto.ADMINISTRATOR])
 
-        self.assertTrue(fehlerliste)  # Eine nicht leere Fehlerliste erwarten
-        self.assertFalse(get_user(anfrage).is_authenticated)
-        self.assertFalse(anfrage.session.exists(alte_sitzungskennung))  # Die Sitzung muss ungültig sein
+        self.assertTrue(fehlerliste)
+        self.assertFalse(get_user(self.anfrage).is_authenticated)
+        self.assertFalse(self.anfrage.session.exists(alte_sitzungskennung))
 
 
 class AnmeldeViewTests(TestCase):
-    # Eine GET-Anfrage an die Anmelde-View muss abgewiesen werden
+    """Prüft HTTP-Zugriff, Anmeldung und Sitzungszuordnung der Anmelde-View."""
+
     def test_fa01_get_anfrage_wird_abgewiesen(self):
-        # Eine GET-Anfrage über die URL-Zuordnung an die View senden
+        """Eine GET-Anfrage wird mit POST als einzig erlaubter Methode abgewiesen."""
         antwort = self.client.get('/anmelden/')
 
-        # Prüfen, dass die verwendete HTTP-Methode abgewiesen wurde
         self.assertEqual(antwort.status_code, 405)
-
-        # Prüfen, dass POST als erlaubte Methode angegeben wird
         self.assertEqual(antwort['Allow'], 'POST')
-
-        # Prüfen, dass die JSON-Antwort keinen Anmeldungserfolg meldet
         self.assertFalse(antwort.json()['erfolg'])
 
-    # Eine POST-Anfrage ohne Anmeldedaten muss abgewiesen werden
     def test_fa01_post_ohne_anmeldedaten_wird_abgewiesen(self):
-        # Die Anmeldefunktion vorübergehend durch ein Testobjekt ersetzen
-        # patch als Ersatz für die tatsächliche Anmeldefunktion verwenden, um zu verhindern, dass sie aufgerufen wird, da keine Anmeldedaten übermittelt werden
+        """Fehlende Anmeldedaten werden vor dem Aufruf der Anmeldefunktion abgewiesen."""
+        # Der Ersatz erfasst Aufrufe: Fehlende Felder müssen bereits die View stoppen.
         with patch('vp_stunden.views.melde_an') as anmeldefunktion:
-            # Eine POST-Anfrage ohne Formularfelder senden
             antwort = self.client.post('/anmelden/', data={})
 
-        self.assertEqual(antwort.status_code, 400)  # Prüfen, dass die Anfrage abgewiesen wurde
-        self.assertFalse(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort keinen Erfolg meldet
-        anmeldefunktion.assert_not_called()  # Prüfen, dass die Anmeldefunktion nicht aufgerufen wurde
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()['erfolg'])
+        anmeldefunktion.assert_not_called()
 
-    # Eine erfolgreiche Anmeldung muss die Sitzung korrekt setzen
     def test_fa01_erfolgreiche_anmeldung(self):
-        # Synthetische Testwerte vorbereiten
+        """Gültige Anmeldedaten ordnen die Sitzung dem angemeldeten Konto zu."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Die gültigen Anmeldedaten als Formularfelder übermitteln
         antwort = self.client.post(
             '/anmelden/',
             data={
@@ -1105,22 +970,21 @@ class AnmeldeViewTests(TestCase):
             }
         )
 
-        self.assertEqual(antwort.status_code, 200)  # Prüfen, dass die Anfrage erfolgreich war
-        self.assertTrue(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort einen Erfolg meldet
-        # SESSION_KEY bezeichnet den Schlüssel, unter dem Django die ID des angemeldeten Benutzers in der Sitzung speichert.
-        self.assertEqual(self.client.session[SESSION_KEY], str(konto.pk))  # Prüfen, dass die Sitzung den angemeldeten Benutzer enthält
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()['erfolg'])
 
-    # Ein falsches Passwort muss die Anmeldung verhindern und die Fehlversuche korrekt zählen
+        # Django speichert die Konto-ID unter SESSION_KEY als Text in der Sitzung.
+        self.assertEqual(self.client.session[SESSION_KEY], str(konto.pk))
+
     def test_fa01_falsches_passwort_verhindert_anmeldung(self):
-        # Synthetische Testwerte vorbereiten
+        """Ein falsches Passwort verhindert die Anmeldung und erhöht den Fehlversuchszähler."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
         konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Ein falsches Passwort übermitteln
         antwort = self.client.post(
             '/anmelden/',
             data={
@@ -1129,29 +993,28 @@ class AnmeldeViewTests(TestCase):
             }
         )
 
-        self.assertEqual(antwort.status_code, 400)  # Prüfen, dass die Anfrage abgewiesen wurde
-        self.assertFalse(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort keinen Erfolg meldet
-        self.assertNotIn(SESSION_KEY, self.client.session)  # Prüfen, dass die Sitzung nicht den angemeldeten Benutzer enthält
+        self.assertEqual(antwort.status_code, 400)
+        self.assertFalse(antwort.json()['erfolg'])
+        self.assertNotIn(SESSION_KEY, self.client.session)
 
-        #prüfen, dass die Fehlversuche korrekt gezählt werden
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
+        konto.refresh_from_db()
         self.assertEqual(konto.fehlversuche, 1)
 
 
 class AbmeldeViewTests(TestCase):
+    """Prüft die Sitzungsbeendigung und die Beschränkung der Abmeldung auf POST."""
 
-    # Eine POST-Anfrage an die Abmelde-View muss die Sitzung beenden
-    def test_qa03_abmeldung_beendet_gespeicherte_sitzung(self):
-        # Synthetische Testwerte vorbereiten
+    def setUp(self):
+        """Bereitet für jeden Test eine tatsächlich angemeldete Sitzung vor."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(self.konto)
+        self.assertFalse(fehlerliste)
 
-        # Die Anmeldung durchführen
-        antwort = self.client.post(
+        self.client.post(
             '/anmelden/',
             data={
                 'benutzername': benutzername,
@@ -1159,286 +1022,213 @@ class AbmeldeViewTests(TestCase):
             }
         )
 
-        # Die angemeldete Sitzung und ihre Kennung festhalten
+    def test_qa03_abmeldung_beendet_gespeicherte_sitzung(self):
+        """POST beendet die Anmeldung und löscht die bisher gespeicherte Sitzung."""
+        # Die bisherige Kennung erlaubt anschließend die Prüfung der gespeicherten Sitzung.
         sitzung_vorher = self.client.session
         alte_sitzungskennung = sitzung_vorher.session_key
 
-        # Kontozuordnung und gespeicherte Sitzung vor der Abmeldung prüfen
-        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))  # Prüfen, dass die Sitzung existiert
-        self.assertEqual(sitzung_vorher[SESSION_KEY], str(konto.pk))  # Prüfen, dass die Sitzung den angemeldeten Benutzer enthält
+        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))
+        self.assertEqual(sitzung_vorher[SESSION_KEY], str(self.konto.pk))
 
-        # Die Abmeldung durchführen
         antwort = self.client.post(
             '/abmelden/',
         )
 
-        self.assertEqual(antwort.status_code, 200)  # Prüfen, dass die Anfrage erfolgreich war
-        self.assertTrue(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort einen Erfolg meldet
-        self.assertNotIn(SESSION_KEY, self.client.session)  # Prüfen, dass die Sitzung nicht den angemeldeten Benutzer enthält
-
-        # Die vorherige Sitzung muss serverseitig gelöscht sein
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()['erfolg'])
+        self.assertNotIn(SESSION_KEY, self.client.session)
         self.assertFalse(sitzung_vorher.exists(alte_sitzungskennung))
 
-    # Eine GET-Anfrage an die Abmelde-View darf die Sitzung nicht beenden
     def test_qa03_get_anfrage_beendet_sitzung_nicht(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        passwort = 'a' * 64
-        rolle = Benutzerkonto.LEHRPERSON
-        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-
-        # Die Anmeldung durchführen
-        antwort = self.client.post(
-            '/anmelden/',
-            data={
-                'benutzername': benutzername,
-                'passwort': passwort
-            }
-        )
-        # Die angemeldete Sitzung und ihre Kennung festhalten
+        """GET wird abgewiesen und erhält die angemeldete Sitzung."""
+        # Die bisherige Kennung erlaubt anschließend die Prüfung der gespeicherten Sitzung.
         sitzung_vorher = self.client.session
         alte_sitzungskennung = sitzung_vorher.session_key
 
-        # Kontozuordnung und gespeicherte Sitzung vor der Abmeldung prüfen
-        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))  # Prüfen, dass die Sitzung existiert
-        self.assertEqual(sitzung_vorher[SESSION_KEY], str(konto.pk))  # Prüfen, dass die Sitzung den angemeldeten Benutzer enthält
+        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))
+        self.assertEqual(sitzung_vorher[SESSION_KEY], str(self.konto.pk))
 
-        # Die Abmeldung über eine GET-Anfrage durchführen
         antwort = self.client.get(
             '/abmelden/',
         )
 
-        # Die GET-Anfrage darf die Sitzung nicht beenden, da nur POST-Anfragen die Abmeldung auslösen
-        self.assertEqual(antwort.status_code, 405)  # Prüfen, dass die verwendete HTTP-Methode abgewiesen wurde
-        self.assertEqual(antwort['Allow'], 'POST')  # Prüfen, dass POST als erlaubte Methode angegeben wird
-        self.assertFalse(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort keinen Erfolg meldet
-
-        # Die Anmeldung und der bisherige Sitzungszustand müssen weiterhin gültig sein
-        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))  # Prüfen, dass die Sitzung weiterhin existiert
-        self.assertEqual(self.client.session[SESSION_KEY], str(konto.pk))  # Prüfen, dass die Sitzung den angemeldeten Benutzer weiterhin enthält
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort['Allow'], 'POST')
+        self.assertFalse(antwort.json()['erfolg'])
+        self.assertTrue(sitzung_vorher.exists(alte_sitzungskennung))
+        self.assertEqual(self.client.session[SESSION_KEY], str(self.konto.pk))
 
 
 class PasswortAenderungTests(TestCase):
+    """Prüft eigene Passwortänderungen und den Erhalt der bestehenden Sitzung."""
 
-    # Eine erfolgreiche Passwortänderung muss das neue Passwort korrekt setzen und die Sitzung beibehalten
-    def test_fa03_erfolgreiche_eigene_passwortaenderung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        altes_passwort = 'a' * 64
-        neues_passwort = 'b' * 64
+    def setUp(self):
+        """Legt für jeden Test dasselbe Konto ohne vorherige Anmeldung an."""
+        self.benutzername = 'testnutzer'
+        self.altes_passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
+        self.konto, fehlerliste = lege_konto_an(
+            self.benutzername, self.altes_passwort, rolle
+        )
+        self.assertIsNotNone(self.konto)
+        self.assertFalse(fehlerliste)
 
-        konto, fehlerliste = lege_konto_an(benutzername, altes_passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+    def test_fa03_erfolgreiche_eigene_passwortaenderung(self):
+        """Ein neues Passwort wird gespeichert und die bestehende Anmeldung bleibt erhalten."""
+        neues_passwort = 'b' * 64
 
+        # Beim direkten Funktionsaufruf muss der Test die Sitzung selbst bereitstellen.
         anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        anfrage.session = self.client.session
 
-        # Die Anmeldung mit dem alten Passwort ausführen
-        fehlerliste_anmeldung = melde_an(anfrage, benutzername, altes_passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        fehlerliste_anmeldung = melde_an(anfrage, self.benutzername, self.altes_passwort)
+        self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Sitzung speichern und den Sitzungsbeginn festhalten
         anfrage.session.save()
         sitzungsbeginn_vorher = anfrage.session['sitzungsbeginn']
 
-        # Die Passwortänderung durchführen
+        # Die spätere Testzeit macht einen unzulässig erneuerten Sitzungsbeginn erkennbar.
         aenderungszeitpunkt = timezone.now() + timezone.timedelta(minutes=5)
         with patch('vp_stunden.sicherheit.timezone.now', return_value=aenderungszeitpunkt):
-            fehlerliste = aendere_passwort(anfrage, altes_passwort, neues_passwort)
+            fehlerliste = aendere_passwort(anfrage, self.altes_passwort, neues_passwort)
 
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-        konto.refresh_from_db()  # Kontoobjekt aus der Datenbank aktualisieren
-        self.assertTrue(konto.check_password(neues_passwort))  # Prüfen, dass das Passwort erfolgreich geändert wurde
-        self.assertFalse(konto.check_password(altes_passwort))  # Prüfen, dass das alte Passwort nicht mehr gültig ist
+        self.assertFalse(fehlerliste)
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
+        self.konto.refresh_from_db()
+        self.assertTrue(self.konto.check_password(neues_passwort))
+        self.assertFalse(self.konto.check_password(self.altes_passwort))
 
-        # Die aktuelle Sitzung speichern und erneut aus der Datenbank laden
         anfrage.session.save()
+        # Neu laden, damit die Anmeldung anhand der tatsächlich gespeicherten Sitzung geprüft wird.
         anfrage.session = SessionStore(
             session_key=anfrage.session.session_key
         )
 
-        # Anmeldung, Kontozuordnung und ursprünglichen Sitzungsbeginn prüfen
         angemeldetes_konto = get_user(anfrage)
         self.assertTrue(angemeldetes_konto.is_authenticated)
-        self.assertEqual(angemeldetes_konto.pk, konto.pk)
+        self.assertEqual(angemeldetes_konto.pk, self.konto.pk)
         self.assertEqual(
             anfrage.session['sitzungsbeginn'], sitzungsbeginn_vorher
         )
 
-
-
     def test_fa03_falsches_bisheriges_passwort_verhindert_aenderung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        altes_passwort = 'a' * 64
+        """Ein falsches bisheriges Passwort wird bei erhaltener Anmeldung abgewiesen."""
         neues_passwort = 'b' * 64
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, altes_passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-
+        # Beim direkten Funktionsaufruf muss der Test die Sitzung selbst bereitstellen.
         anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        anfrage.session = self.client.session
 
-        # Die Anmeldung mit dem alten Passwort ausführen
-        fehlerliste_anmeldung = melde_an(anfrage, benutzername, altes_passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        fehlerliste_anmeldung = melde_an(anfrage, self.benutzername, self.altes_passwort)
+        self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Sitzung speichern und den Sitzungsbeginn festhalten
         anfrage.session.save()
         sitzungsbeginn_vorher = anfrage.session['sitzungsbeginn']
 
-        # Den gespeicherten Passwort-Hash zum späteren Vergleich festhalten
-        passwort_hash_vorher = konto.password
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
+        passwort_hash_vorher = self.konto.password
 
-        # Die Passwortänderung mit einem falschen bisherigen Passwort durchführen
+        # Die spätere Testzeit macht einen unzulässig erneuerten Sitzungsbeginn erkennbar.
         aenderungszeitpunkt = timezone.now() + timezone.timedelta(minutes=5)
         with patch('vp_stunden.sicherheit.timezone.now', return_value=aenderungszeitpunkt):
             fehlerliste = aendere_passwort(anfrage, 'falsches_passwort', neues_passwort)
 
-        # Die Passwortänderung muss abgewiesen werden
         self.assertTrue(fehlerliste)
 
-        # Das Kontoobjekt aus der Datenbank aktualisieren
-        konto.refresh_from_db()
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
+        self.konto.refresh_from_db()
+        self.assertEqual(self.konto.password, passwort_hash_vorher)
+        self.assertTrue(self.konto.check_password(self.altes_passwort))
+        self.assertFalse(self.konto.check_password(neues_passwort))
 
-        # Das alte Passwort muss weiterhin gültig sein
-        self.assertEqual(konto.password, passwort_hash_vorher)
-        self.assertTrue(konto.check_password(altes_passwort))
-
-        # Das abgewiesene neue Passwort darf nicht gültig sein
-        self.assertFalse(konto.check_password(neues_passwort))
-
-        # Die aktuelle Sitzung speichern und erneut aus der Datenbank laden
         anfrage.session.save()
+        # Neu laden, damit die Anmeldung anhand der tatsächlich gespeicherten Sitzung geprüft wird.
         anfrage.session = SessionStore(
             session_key=anfrage.session.session_key
         )
 
-        # Anmeldung, Kontozuordnung und ursprünglichen Sitzungsbeginn prüfen
         angemeldetes_konto = get_user(anfrage)
         self.assertTrue(angemeldetes_konto.is_authenticated)
-        self.assertEqual(angemeldetes_konto.pk, konto.pk)
+        self.assertEqual(angemeldetes_konto.pk, self.konto.pk)
         self.assertEqual(
             anfrage.session['sitzungsbeginn'], sitzungsbeginn_vorher
         )
 
-    # Eine Passwortänderung mit einem zu kurzen neuen Passwort muss abgewiesen werden
     def test_qa01_zu_kurzes_neues_passwort_verhindert_aenderung(self):
-        # Synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        altes_passwort = 'a' * 64
-        # Ein neues Passwort unterhalb der Mindestlänge vorbereiten
+        """Ein zu kurzes neues Passwort wird bei erhaltener Anmeldung abgewiesen."""
         neues_passwort = 'b' * 14
-        rolle = Benutzerkonto.LEHRPERSON
 
-        konto, fehlerliste = lege_konto_an(benutzername, altes_passwort, rolle)
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
-
+        # Beim direkten Funktionsaufruf muss der Test die Sitzung selbst bereitstellen.
         anfrage = HttpRequest()
-        anfrage.session = self.client.session  # Sitzungsobjekt für den direkten Funktionsaufruf bereitstellen
+        anfrage.session = self.client.session
 
-        # Die Anmeldung mit dem alten Passwort ausführen
-        fehlerliste_anmeldung = melde_an(anfrage, benutzername, altes_passwort)
-        self.assertFalse(fehlerliste_anmeldung)  # Eine leere Fehlerliste erwarten
+        fehlerliste_anmeldung = melde_an(anfrage, self.benutzername, self.altes_passwort)
+        self.assertFalse(fehlerliste_anmeldung)
 
-        # Die Sitzung speichern und den Sitzungsbeginn festhalten
         anfrage.session.save()
         sitzungsbeginn_vorher = anfrage.session['sitzungsbeginn']
 
-        # Den gespeicherten Passwort-Hash zum späteren Vergleich festhalten
-        passwort_hash_vorher = konto.password
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
+        passwort_hash_vorher = self.konto.password
 
-        # Die Passwortänderung mit einem zu kurzen neuen Passwort durchführen
+        # Die spätere Testzeit macht einen unzulässig erneuerten Sitzungsbeginn erkennbar.
         aenderungszeitpunkt = timezone.now() + timezone.timedelta(minutes=5)
         with patch('vp_stunden.sicherheit.timezone.now', return_value=aenderungszeitpunkt):
-            fehlerliste = aendere_passwort(anfrage, altes_passwort, neues_passwort)
+            fehlerliste = aendere_passwort(anfrage, self.altes_passwort, neues_passwort)
 
-        # Die Passwortänderung muss abgewiesen werden
         self.assertTrue(fehlerliste)
 
-        # Das Kontoobjekt aus der Datenbank aktualisieren
-        konto.refresh_from_db()
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
+        self.konto.refresh_from_db()
+        self.assertEqual(self.konto.password, passwort_hash_vorher)
+        self.assertTrue(self.konto.check_password(self.altes_passwort))
+        self.assertFalse(self.konto.check_password(neues_passwort))
 
-        # Das alte Passwort muss weiterhin gültig sein
-        self.assertEqual(konto.password, passwort_hash_vorher)
-        self.assertTrue(konto.check_password(altes_passwort))
-
-        # Das abgewiesene neue Passwort darf nicht gültig sein
-        self.assertFalse(konto.check_password(neues_passwort))
-
-        # Die aktuelle Sitzung speichern und erneut aus der Datenbank laden
         anfrage.session.save()
+        # Neu laden, damit die Anmeldung anhand der tatsächlich gespeicherten Sitzung geprüft wird.
         anfrage.session = SessionStore(
             session_key=anfrage.session.session_key
         )
 
-        # Anmeldung, Kontozuordnung und ursprünglichen Sitzungsbeginn prüfen
         angemeldetes_konto = get_user(anfrage)
         self.assertTrue(angemeldetes_konto.is_authenticated)
-        self.assertEqual(angemeldetes_konto.pk, konto.pk)
+        self.assertEqual(angemeldetes_konto.pk, self.konto.pk)
         self.assertEqual(
             anfrage.session['sitzungsbeginn'], sitzungsbeginn_vorher
         )
 
-    # Eine Passwortänderung ohne vorherige Anmeldung muss abgewiesen werden
     def test_fa03_ohne_anmeldung_wird_passwortaenderung_verweigert(self):
-        # Gültige synthetische Testwerte vorbereiten
-        benutzername = 'testnutzer'
-        altes_passwort = 'a' * 64
+        """Ohne Anmeldung werden weder das Passwort geändert noch eine Anmeldung hergestellt."""
         neues_passwort = 'b' * 64
-        rolle = Benutzerkonto.LEHRPERSON
 
-        # Ein Konto mit dem bisherigen Passwort anlegen
-        konto, fehlerliste = lege_konto_an(
-            benutzername, altes_passwort, rolle
-        )
-        self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
+        passwort_hash_vorher = self.konto.password
 
-        # Den gespeicherten Passwort-Hash zum späteren Vergleich festhalten
-        passwort_hash_vorher = konto.password
-
-        # Eine Anfrage mit Sitzung, aber ohne Anmeldung vorbereiten
+        # Beim direkten Funktionsaufruf muss der Test die Sitzung selbst bereitstellen.
         anfrage = HttpRequest()
         anfrage.session = self.client.session
         self.assertFalse(get_user(anfrage).is_authenticated)
 
-        # Die Passwortänderung ohne vorherige Anmeldung versuchen
         fehlerliste = aendere_passwort(
-            anfrage, altes_passwort, neues_passwort
+            anfrage, self.altes_passwort, neues_passwort
         )
 
-        # Die Passwortänderung muss abgewiesen werden
         self.assertTrue(fehlerliste)
 
-        # Den tatsächlich gespeicherten Kontozustand erneut laden
-        konto.refresh_from_db()
-
-        # Der Passwort-Hash muss unverändert bleiben
-        self.assertEqual(konto.password, passwort_hash_vorher)
-
-        # Das alte Passwort muss weiterhin gültig sein
-        self.assertTrue(konto.check_password(altes_passwort))
-
-        # Das abgewiesene neue Passwort darf nicht gültig sein
-        self.assertFalse(konto.check_password(neues_passwort))
-
-        # Die abgewiesene Änderung darf keine Anmeldung herstellen
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
+        self.konto.refresh_from_db()
+        self.assertEqual(self.konto.password, passwort_hash_vorher)
+        self.assertTrue(self.konto.check_password(self.altes_passwort))
+        self.assertFalse(self.konto.check_password(neues_passwort))
         self.assertFalse(get_user(anfrage).is_authenticated)
 
 
 class PasswortAenderungViewTests(TestCase):
+    """Prüft Formularprüfung und Zugriffsschutz der Passwortänderungs-View."""
 
-    # Eine POST-Anfrage an die Passwortänderung-View muss die Passwortänderung korrekt durchführen
     def test_fa03_post_anfrage_aendert_passwort(self):
-        # Synthetische Testwerte vorbereiten
+        """Vollständige gültige Formulardaten ändern das Passwort des angemeldeten Kontos."""
         benutzername = 'testnutzer'
         altes_passwort = 'a' * 64
         neues_passwort = 'b' * 64
@@ -1446,9 +1236,8 @@ class PasswortAenderungViewTests(TestCase):
 
         konto, fehlerliste = lege_konto_an(benutzername, altes_passwort, rolle)
         self.assertIsNotNone(konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Die Anmeldung durchführen
         antwort = self.client.post(
             '/anmelden/',
             data={
@@ -1459,7 +1248,6 @@ class PasswortAenderungViewTests(TestCase):
         self.assertEqual(antwort.status_code, 200)
         self.assertTrue(antwort.json()['erfolg'])
 
-        # Die Passwortänderung mit allen drei erforderlichen Formularfeldern anfragen
         antwort = self.client.post(
             '/passwort_aendern/',
             data={
@@ -1469,29 +1257,26 @@ class PasswortAenderungViewTests(TestCase):
             }
         )
 
-        self.assertEqual(antwort.status_code, 200)  # Prüfen, dass die Anfrage erfolgreich war
-        self.assertTrue(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort einen Erfolg meldet
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()['erfolg'])
 
-        # Das Kontoobjekt aus der Datenbank aktualisieren und das neue Passwort prüfen
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
-        self.assertTrue(konto.check_password(neues_passwort))  # Prüfen, dass das Passwort erfolgreich geändert wurde
-
+        self.assertTrue(konto.check_password(neues_passwort))
 
     def test_fa03_abweichende_passwortwiederholung_verhindert_aenderung(self):
-        # Gültige synthetische Testwerte vorbereiten
+        """Eine abweichende Passwortwiederholung lässt das gespeicherte Passwort unverändert."""
         benutzername = 'testnutzer'
         altes_passwort = 'a' * 64
         neues_passwort = 'b' * 64
         rolle = Benutzerkonto.LEHRPERSON
 
-        # Ein Konto mit dem bisherigen Passwort anlegen
         konto, fehlerliste = lege_konto_an(
             benutzername, altes_passwort, rolle
         )
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die Anmeldung über die Anmelde-View durchführen
         antwort = self.client.post(
             '/anmelden/',
             data={
@@ -1502,10 +1287,9 @@ class PasswortAenderungViewTests(TestCase):
         self.assertEqual(antwort.status_code, 200)
         self.assertTrue(antwort.json()['erfolg'])
 
-        # Den bisherigen Passwort-Hash zum späteren Vergleich sichern
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
         passwort_hash_vorher = konto.password
 
-        # Die Passwortänderung mit einer abweichenden Wiederholung versuchen
         antwort = self.client.post(
             '/passwort_aendern/',
             data={
@@ -1515,41 +1299,31 @@ class PasswortAenderungViewTests(TestCase):
             }
         )
 
-        # Die unterschiedlichen neuen Passwörter müssen abgewiesen werden
         self.assertEqual(antwort.status_code, 400)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Den tatsächlich gespeicherten Kontozustand erneut laden
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
-
-        # Der gespeicherte Passwort-Hash muss unverändert bleiben
         self.assertEqual(konto.password, passwort_hash_vorher)
-
-        # Das alte Passwort muss weiterhin gültig sein
         self.assertTrue(konto.check_password(altes_passwort))
-
-        # Das abgewiesene neue Passwort darf nicht gültig sein
         self.assertFalse(konto.check_password(neues_passwort))
 
-    # Eine POST-Anfrage an die Passwortänderung-View ohne vorherige Anmeldung muss abgewiesen werden
     def test_fa03_post_ohne_anmeldung_wird_abgewiesen(self):
-        # Gültige synthetische Testwerte vorbereiten
+        """Eine Passwortänderung ohne Anmeldung wird ohne Datenänderung abgewiesen."""
         benutzername = 'testnutzer'
         altes_passwort = 'a' * 64
         neues_passwort = 'b' * 64
         rolle = Benutzerkonto.LEHRPERSON
 
-        # Ein Konto anlegen, ohne sich anschließend anzumelden
         konto, fehlerliste = lege_konto_an(
             benutzername, altes_passwort, rolle
         )
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Den bisherigen Passwort-Hash zum späteren Vergleich sichern
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
         passwort_hash_vorher = konto.password
 
-        # Ohne Anmeldung eine vollständige Passwortänderungsanfrage senden
         antwort = self.client.post(
             '/passwort_aendern/',
             data={
@@ -1559,51 +1333,37 @@ class PasswortAenderungViewTests(TestCase):
             }
         )
 
-        # Den Zugriff wegen der fehlenden Anmeldung verweigern
         self.assertEqual(antwort.status_code, 403)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Den tatsächlich gespeicherten Kontozustand erneut laden
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
-
-        # Der gespeicherte Passwort-Hash muss unverändert bleiben
         self.assertEqual(konto.password, passwort_hash_vorher)
-
-        # Das alte Passwort muss weiterhin gültig sein
         self.assertTrue(konto.check_password(altes_passwort))
-
-        # Das abgewiesene neue Passwort darf nicht gültig sein
         self.assertFalse(konto.check_password(neues_passwort))
 
-    # Eine GET-Anfrage an die Passwortänderung-View muss abgewiesen werden
     def test_fa03_get_anfrage_wird_abgewiesen(self):
-        # Eine GET-Anfrage über die URL-Zuordnung an die View senden
+        """Die Passwortänderungs-View weist GET ab und erlaubt ausschließlich POST."""
         antwort = self.client.get('/passwort_aendern/')
 
-        # Die nicht erlaubte HTTP-Methode muss abgewiesen werden
         self.assertEqual(antwort.status_code, 405)
-
-        # Der Allow-Header muss POST als erlaubte Methode nennen
         self.assertEqual(antwort['Allow'], 'POST')
-
-        # Die JSON-Antwort darf keinen Erfolg melden
         self.assertFalse(antwort.json()['erfolg'])
 
 
 class KontoErstellungViewTests(TestCase):
+    """Prüft Kontenanlage und Rollenprüfung über die Kontoerstellungs-View."""
 
     def test_fa02_administrator_kann_konto_anlegen(self):
-        # Synthetische Testwerte vorbereiten
+        """Ein Administratorkonto kann ein Konto mit den angefragten Daten anlegen."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.LEHRPERSON
 
-        # Ein Administrator-Konto anlegen und sich anmelden
         admin_konto, fehlerliste = lege_konto_an('admin', 'adminpasswort12', Benutzerkonto.ADMINISTRATOR)
         self.assertIsNotNone(admin_konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Die Anmeldung über die Anmelde-View durchführen
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1612,14 +1372,10 @@ class KontoErstellungViewTests(TestCase):
             }
         )
 
-        # Prüfen, dass die Anmeldung erfolgreich war
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
-
-        #Prüfen, dass der neue Benutzername noch nicht existiert
         self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
 
-        # Die Kontoerstellung mit allen erforderlichen Formularfeldern anfragen
         antwort = self.client.post(
             '/konto_anlegen/',
             data={
@@ -1629,31 +1385,25 @@ class KontoErstellungViewTests(TestCase):
             }
         )
 
-        # Prüfen, dass die Kontoerstellung erfolgreich war
         self.assertEqual(antwort.status_code, 200)
-        self.assertTrue(antwort.json()['erfolg'])  # Prüfen, dass die JSON-Antwort einen Erfolg meldet
+        self.assertTrue(antwort.json()['erfolg'])
 
-        # Das angelegte Konto erneut aus der Datenbank laden
         neues_konto = Benutzerkonto.objects.get(username=benutzername)
 
-        # Die gespeicherten Kontodaten prüfen
         self.assertEqual(neues_konto.username, benutzername)
         self.assertEqual(neues_konto.rolle, rolle)
         self.assertTrue(neues_konto.check_password(passwort))
 
-
     def test_qa04_lehrperson_kann_kein_konto_anlegen(self):
-        # Synthetische Testwerte vorbereiten
+        """Eine Lehrperson darf auch mit vollständigen Daten kein Konto anlegen."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Ein Lehrperson-Konto anlegen und sich anmelden
         lehrperson_konto, fehlerliste = lege_konto_an('lehrperson', 'lehrpersonpasswort12', Benutzerkonto.LEHRPERSON)
         self.assertIsNotNone(lehrperson_konto)
-        self.assertFalse(fehlerliste)  # Eine leere Fehlerliste erwarten
+        self.assertFalse(fehlerliste)
 
-        # Die Anmeldung über die Anmelde-View durchführen
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1662,17 +1412,12 @@ class KontoErstellungViewTests(TestCase):
             }
         )
 
-        # Prüfen, dass die Anmeldung erfolgreich war
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
-
-        # Prüfen, dass der neue Benutzername noch nicht existiert
         self.assertFalse(Benutzerkonto.objects.filter(username=benutzername).exists())
 
-        # Die aktuelle Anzahl der Benutzerkonten vor der Kontoerstellung festhalten
         kontozahl_vorher = Benutzerkonto.objects.count()
 
-        # Die Kontoerstellung mit allen erforderlichen Formularfeldern anfragen
         antwort = self.client.post(
             '/konto_anlegen/',
             data={
@@ -1682,11 +1427,8 @@ class KontoErstellungViewTests(TestCase):
             }
         )
 
-        # Die Kontenanlage durch eine Lehrperson verweigern
         self.assertEqual(antwort.status_code, 403)
         self.assertFalse(antwort.json()['erfolg'])
-
-        # Es darf kein neues Konto angelegt worden sein
         self.assertFalse(
             Benutzerkonto.objects.filter(username=benutzername).exists()
         )
@@ -1694,22 +1436,18 @@ class KontoErstellungViewTests(TestCase):
             Benutzerkonto.objects.count(), kontozahl_vorher
         )
 
-
     def test_qa04_kontoanlage_ohne_anmeldung_wird_abgewiesen(self):
-        # Gültige synthetische Daten für das angefragte Konto vorbereiten
+        """Ohne Anmeldung bleibt die Kontenanlage ohne Datenänderung verweigert."""
         benutzername = 'testnutzer'
         passwort = 'a' * 64
         rolle = Benutzerkonto.ADMINISTRATOR
 
-        # Prüfen, dass der angefragte Benutzername noch nicht existiert
         self.assertFalse(
             Benutzerkonto.objects.filter(username=benutzername).exists()
         )
 
-        # Die aktuelle Kontenzahl zum späteren Vergleich festhalten
         kontozahl_vorher = Benutzerkonto.objects.count()
 
-        # Ohne vorherige Anmeldung eine vollständige Kontenanlage anfragen
         antwort = self.client.post(
             '/konto_anlegen/',
             data={
@@ -1719,38 +1457,30 @@ class KontoErstellungViewTests(TestCase):
             }
         )
 
-        # Den Zugriff wegen der fehlenden Anmeldung verweigern
         self.assertEqual(antwort.status_code, 403)
         self.assertFalse(antwort.json()['erfolg'])
-
-        # Der angefragte Benutzername darf weiterhin nicht existieren
         self.assertFalse(
             Benutzerkonto.objects.filter(username=benutzername).exists()
         )
 
-        # Die Kontenzahl muss unverändert bleiben
         self.assertEqual(
             Benutzerkonto.objects.count(), kontozahl_vorher
         )
 
     def test_fa02_get_anfrage_wird_abgewiesen(self):
-        # Eine GET-Anfrage über die URL-Zuordnung an die View senden
+        """Die View weist GET ab und nennt POST als einzig erlaubte Methode."""
         antwort = self.client.get('/konto_anlegen/')
 
-        # Die nicht erlaubte HTTP-Methode muss abgewiesen werden
         self.assertEqual(antwort.status_code, 405)
-
-        # POST muss als erlaubte Methode angegeben werden
         self.assertEqual(antwort['Allow'], 'POST')
-
-        # Die JSON-Antwort darf keinen Erfolg melden
         self.assertFalse(antwort.json()['erfolg'])
 
 
 class PasswortZuruecksetzenViewTests(TestCase):
+    """Prüft administrative Passwortrücksetzung und abgewiesene Zugriffe."""
 
     def test_fa02_administrator_kann_passwort_zuruecksetzen(self):
-        # Ein Administratorkonto vorbereiten
+        """Ein Administratorkonto kann das Passwort eines separaten Zielkontos zurücksetzen."""
         admin_benutzername = 'testadmin'
         admin_passwort = 'a' * 64
         admin_konto, fehlerliste = lege_konto_an(
@@ -1759,7 +1489,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertIsNotNone(admin_konto)
         self.assertFalse(fehlerliste)
 
-        # Ein separates Lehrpersonenkonto als Ziel vorbereiten
         passwort = 'b' * 64
         neues_passwort = 'c' * 64
         konto, fehlerliste = lege_konto_an(
@@ -1768,7 +1497,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Mit dem Administratorkonto anmelden
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1779,7 +1507,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
 
-        # Das Passwort des Zielkontos über dessen tatsächliche ID zurücksetzen
         antwort = self.client.post(
             '/passwort_zuruecksetzen/',
             data={
@@ -1790,13 +1517,13 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort.status_code, 200)
         self.assertTrue(antwort.json()['erfolg'])
 
-        # Den gespeicherten Zustand des Zielkontos prüfen
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
         self.assertTrue(konto.check_password(neues_passwort))
         self.assertFalse(konto.check_password(passwort))
 
     def test_qa04_lehrperson_kann_kein_passwort_zuruecksetzen(self):
-        # Ein Lehrpersonenkonto für die Anmeldung vorbereiten
+        """Eine Lehrperson kann das Passwort eines fremden Administratorkontos nicht ändern."""
         benutzername = 'testlehrperson'
         passwort = 'a' * 64
         lehrperson_konto, fehlerliste = lege_konto_an(
@@ -1805,7 +1532,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertIsNotNone(lehrperson_konto)
         self.assertFalse(fehlerliste)
 
-        # Ein Administratorkonto als Ziel der unberechtigten Anfrage vorbereiten
         zielpasswort = 'b' * 64
         neues_passwort = 'c' * 64
         konto, fehlerliste = lege_konto_an(
@@ -1813,9 +1539,9 @@ class PasswortZuruecksetzenViewTests(TestCase):
         )
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
         passwort_hash_vorher = konto.password
 
-        # Mit dem Lehrpersonenkonto regulär anmelden
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1826,7 +1552,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
 
-        # Die Rücksetzung für das fremde Administratorkonto versuchen
         antwort = self.client.post(
             '/passwort_zuruecksetzen/',
             data={
@@ -1837,14 +1562,14 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort.status_code, 403)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Das Zielkonto muss unverändert bleiben
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
         self.assertEqual(konto.password, passwort_hash_vorher)
         self.assertTrue(konto.check_password(zielpasswort))
         self.assertFalse(konto.check_password(neues_passwort))
 
     def test_qa04_ruecksetzung_ohne_anmeldung_wird_abgewiesen(self):
-        # Ein Zielkonto vorbereiten, ohne sich anzumelden
+        """Ohne Anmeldung bleibt die Passwortrücksetzung ohne Datenänderung verweigert."""
         passwort = 'a' * 64
         neues_passwort = 'b' * 64
         konto, fehlerliste = lege_konto_an(
@@ -1852,9 +1577,9 @@ class PasswortZuruecksetzenViewTests(TestCase):
         )
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
         passwort_hash_vorher = konto.password
 
-        # Ohne Anmeldung eine vollständige Rücksetzungsanfrage senden
         antwort = self.client.post(
             '/passwort_zuruecksetzen/',
             data={
@@ -1865,23 +1590,22 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort.status_code, 403)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Die abgewiesene Anfrage darf das Passwort nicht verändern
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
         self.assertEqual(konto.password, passwort_hash_vorher)
         self.assertTrue(konto.check_password(passwort))
         self.assertFalse(konto.check_password(neues_passwort))
 
     def test_fa02_get_anfrage_wird_abgewiesen(self):
-        # Eine GET-Anfrage an die Rücksetzungs-View senden
+        """Die View weist GET ab und nennt POST als einzig erlaubte Methode."""
         antwort = self.client.get('/passwort_zuruecksetzen/')
 
-        # Die View darf ausschließlich POST zulassen
         self.assertEqual(antwort.status_code, 405)
         self.assertEqual(antwort['Allow'], 'POST')
         self.assertFalse(antwort.json()['erfolg'])
 
     def test_fa02_ungueltige_konto_id_wird_abgewiesen(self):
-        # Ein Administratorkonto vorbereiten
+        """Eine nicht numerische Konto-ID wird vor dem Aufruf der Rücksetzfunktion abgewiesen."""
         benutzername = 'testadmin'
         passwort = 'a' * 64
         admin_konto, fehlerliste = lege_konto_an(
@@ -1890,7 +1614,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertIsNotNone(admin_konto)
         self.assertFalse(fehlerliste)
 
-        # Mit dem Administratorkonto regulär anmelden
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1901,9 +1624,8 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
 
-        # Die Rücksetzfunktion durch ein Testobjekt ersetzen, das Aufrufe erfasst
+        # Die View muss die ID prüfen, bevor sie die Rücksetzfunktion aufruft.
         with patch('vp_stunden.views.setze_passwort_zurueck') as ruecksetzfunktion:
-            # Eine Konto-ID senden, die keine Ganzzahl darstellt
             antwort = self.client.post(
                 '/passwort_zuruecksetzen/',
                 data={
@@ -1915,11 +1637,10 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort.status_code, 400)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Die ungültige ID muss bereits in der View abgefangen werden
         ruecksetzfunktion.assert_not_called()
 
     def test_qa01_zu_kurzes_passwort_verhindert_ruecksetzung(self):
-        # Ein Administratorkonto vorbereiten
+        """Ein zu kurzes neues Passwort lässt das gespeicherte Zielpasswort unverändert."""
         admin_benutzername = 'testadmin'
         admin_passwort = 'a' * 64
         admin_konto, fehlerliste = lege_konto_an(
@@ -1928,7 +1649,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertIsNotNone(admin_konto)
         self.assertFalse(fehlerliste)
 
-        # Ein Zielkonto mit gültigem bisherigem Passwort vorbereiten
         passwort = 'b' * 64
         neues_passwort = 'c' * 14
         konto, fehlerliste = lege_konto_an(
@@ -1936,9 +1656,9 @@ class PasswortZuruecksetzenViewTests(TestCase):
         )
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
+        # Auch der gespeicherte Hash muss bei einer Abweisung unverändert bleiben.
         passwort_hash_vorher = konto.password
 
-        # Mit dem Administratorkonto regulär anmelden
         antwort_anmeldung = self.client.post(
             '/anmelden/',
             data={
@@ -1949,7 +1669,6 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort_anmeldung.status_code, 200)
         self.assertTrue(antwort_anmeldung.json()['erfolg'])
 
-        # Die Rücksetzung mit einem Passwort unterhalb der Mindestlänge versuchen
         antwort = self.client.post(
             '/passwort_zuruecksetzen/',
             data={
@@ -1960,7 +1679,7 @@ class PasswortZuruecksetzenViewTests(TestCase):
         self.assertEqual(antwort.status_code, 400)
         self.assertFalse(antwort.json()['erfolg'])
 
-        # Der gespeicherte Hash und das bisherige Passwort müssen erhalten bleiben
+        # Für die folgenden Prüfungen den tatsächlich gespeicherten Zustand laden.
         konto.refresh_from_db()
         self.assertEqual(konto.password, passwort_hash_vorher)
         self.assertTrue(konto.check_password(passwort))
@@ -1968,13 +1687,13 @@ class PasswortZuruecksetzenViewTests(TestCase):
 
 
 class VPDatenmodellTests(TestCase):
+    """Prüft die Eindeutigkeitsregeln für Untersuchungen und Teilnahmen."""
 
     def test_fa08_vergleichswert_ist_eindeutig(self):
-        # Zwei verschiedene Untersuchungen mit demselben Vergleichswert anlegen
+        """Die Datenbank verhindert zwei Untersuchungen mit demselben Studienvergleichswert."""
         anzeigename1 = 'Teststudie A'
         vergleichswert1 = 'teststudie a'
 
-        # Die erste Untersuchung erfolgreich anlegen
         studie1 = Untersuchung.objects.create(
             studienname=anzeigename1,
             studienname_vergleich=vergleichswert1,
@@ -1984,14 +1703,12 @@ class VPDatenmodellTests(TestCase):
         )
 
         anzeigename2 = 'TESTSTUDIE A '
-        vergleichswert2 = 'teststudie a'  # Derselbe Vergleichswert wie bei studieA
+        vergleichswert2 = 'teststudie a'
 
-        # Der Versuch, eine zweite Untersuchung mit demselben Vergleichswert anzulegen, muss eine Integritätsverletzung auslösen
-        # Den fehlgeschlagenen Schreibversuch zuerst zum Sicherungspunkt zurückrollen
-        # und danach den erwarteten Integritätsfehler abfangen, damit anschließende
-        # Datenbankabfragen im Test möglich bleiben.
-        with self.assertRaises(IntegrityError): # Die Integritätsverletzung wird erwartet, da der Vergleichswert eindeutig sein muss
-            with transaction.atomic(): #
+        # Der innere Sicherungspunkt wird vor dem Abfangen des Fehlers zurückgerollt.
+        # Dadurch bleiben die anschließenden Datenbankabfragen im Test möglich.
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
                 Untersuchung.objects.create(
                     studienname=anzeigename2,
                     studienname_vergleich=vergleichswert2,
@@ -2000,12 +1717,10 @@ class VPDatenmodellTests(TestCase):
                     lehrperson='testdozentB',
                 )
 
-        # Prüfen, dass nur die erste Untersuchung erfolgreich in der Datenbank gespeichert wurde
         self.assertEqual(Untersuchung.objects.count(), 1)
 
-
     def test_fa12_teilnahmezuordnung_ist_eindeutig(self):
-        # Erste Untersuchung anlegen
+        """Nur die Kombination aus Untersuchung und Matrikelnummer muss eindeutig sein."""
         studie1 = Untersuchung.objects.create(
             studienname='Studie 1',
             studienname_vergleich='studie 1',
@@ -2014,7 +1729,6 @@ class VPDatenmodellTests(TestCase):
             lehrperson='dozent1',
         )
 
-        # Zweite Untersuchung anlegen
         studie2 = Untersuchung.objects.create(
             studienname='Studie 2',
             studienname_vergleich='studie 2',
@@ -2023,7 +1737,6 @@ class VPDatenmodellTests(TestCase):
             lehrperson='dozent2',
         )
 
-        #Teilnahmezuordnungen anlegen
         teilnahme1 = Teilnahme.objects.create(
             untersuchung=studie1,
             matrikelnummer='1234567',
@@ -2039,10 +1752,8 @@ class VPDatenmodellTests(TestCase):
             matrikelnummer='7654321',
         )
 
-        # Erste Zuordnung erneut anlegen, was eine Integritätsverletzung auslösen muss
-        # Den fehlgeschlagenen Schreibversuch zuerst zum Sicherungspunkt zurückrollen
-        # und danach den erwarteten Integritätsfehler abfangen, damit anschließende
-        # Datenbankabfragen im Test möglich bleiben.
+        # Der innere Sicherungspunkt wird vor dem Abfangen des Fehlers zurückgerollt.
+        # Dadurch bleiben die anschließenden Datenbankabfragen im Test möglich.
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 Teilnahme.objects.create(
@@ -2050,20 +1761,19 @@ class VPDatenmodellTests(TestCase):
                     matrikelnummer='1234567',
                 )
 
-        # Prüfen, dass nur die drei eindeutigen Zuordnungen in der Datenbank gespeichert wurden
         self.assertEqual(Teilnahme.objects.count(), 3)
 
-# SimpleTestCase wird verwendet, da keine Datenbankzugriffe in den EinordnungTests durchgeführt werden
+
 class EinordnungTests(SimpleTestCase):
+    """Prüft zulässige Einordnungswerte ohne Datenbankzugriff."""
 
     def test_fa07_gueltige_einordnung_bleibt_unveraendert(self):
-        # Der Aufruf mit 'P' muss 'P' zurückgeben
+        """Die zulässigen Werte P und O werden unverändert zurückgegeben."""
         self.assertEqual(pruefe_einordnung('P'), 'P')
-
-        # Der Aufruf mit 'O' muss 'O' zurückgeben
         self.assertEqual(pruefe_einordnung('O'), 'O')
 
     def test_fa07_ungueltige_einordnung_wird_abgewiesen(self):
+        """Andere Schreibweisen und Datentypen lösen einen Validierungsfehler aus."""
         for ungueltige_einordnung in ['p', 'o', ' P ', 'P ', '', 'X', None, 1, True]:
             with self.subTest(wert=ungueltige_einordnung):
                 with self.assertRaises(ValidationError):
@@ -2071,14 +1781,16 @@ class EinordnungTests(SimpleTestCase):
 
 
 class MatrikelnummerTests(SimpleTestCase):
+    """Prüft Zahlenformat und Wertebereich der Matrikelnummer ohne Datenbankzugriff."""
 
     def test_fa07_gueltige_matrikelnummer_wird_als_text_zurueckgegeben(self):
-        # Der Aufruf mit einer gültigen Matrikelnummer muss die Matrikelnummer als Text zurückgeben
+        """Gültige siebenstellige Ganzzahlen werden als Text zurückgegeben."""
         self.assertEqual(pruefe_matrikelnummer(1000000), '1000000')
         self.assertEqual(pruefe_matrikelnummer(1234567), '1234567')
         self.assertEqual(pruefe_matrikelnummer(9999999), '9999999')
 
     def test_fa07_ungueltige_matrikelnummer_wird_abgewiesen(self):
+        """Werte außerhalb des Bereichs und unzulässige Datentypen werden abgewiesen."""
         for ungueltige_matrikelnummer in [999_999, 10_000_000, 0, -1234567, '1234567', 1234567.0, 1234567.5, None, True, False]:
             with self.subTest(wert=ungueltige_matrikelnummer):
                 with self.assertRaises(ValidationError):
@@ -2086,31 +1798,29 @@ class MatrikelnummerTests(SimpleTestCase):
 
 
 class LehrpersonTests(SimpleTestCase):
+    """Prüft Bereinigung und Längengrenzen der Lehrpersonenangabe."""
 
     def test_fa07_gueltiger_lehrpersonenname_wird_bereinigt(self):
-        # Äußere Leerzeichen entfernen.
+        """Zulässige Namen verlieren nur äußere Leerzeichen und behalten innere Leerzeichen."""
         self.assertEqual(
             pruefe_lehrperson('  Dr. Müller  '),
             'Dr. Müller'
         )
 
-        # Innere Leerzeichen unverändert erhalten.
         self.assertEqual(
             pruefe_lehrperson('Herr  Müller'),
             'Herr  Müller'
         )
 
-        # Ein einzelnes Zeichen erfüllt die Mindestlänge.
         self.assertEqual(pruefe_lehrperson('A'), 'A')
-
-        # Genau 100 Zeichen nach Entfernung äußerer Leerzeichen zulassen.
         self.assertEqual(
+            # Die Längengrenze gilt nach Entfernung der äußeren Leerzeichen.
             pruefe_lehrperson('  ' + 'A' * 100 + '  '),
             'A' * 100
         )
 
     def test_fa07_ungueltiger_lehrpersonenname_wird_abgewiesen(self):
-        # Leere Texte, überlange Namen und falsche Datentypen abweisen.
+        """Leere und überlange Namen sowie unzulässige Datentypen werden abgewiesen."""
         for ungueltiger_name in ['', '   ', 'A' * 101, None, 123, True]:
             with self.subTest(wert=ungueltiger_name):
                 with self.assertRaises(ValidationError):
@@ -2118,42 +1828,38 @@ class LehrpersonTests(SimpleTestCase):
 
 
 class StudiennameTests(SimpleTestCase):
+    """Prüft Anzeigenamen und Vergleichswerte der Studiennamen."""
 
     def test_fa07_gueltiger_studienname_liefert_anzeigename_und_vergleichswert(self):
-        # Äußere Leerzeichen entfernen und beide Werte zurückgeben.
+        """Zulässige Studiennamen liefern bereinigte Anzeigenamen und Vergleichswerte."""
         self.assertEqual(
             pruefe_studienname('  Teststudie A  '),
             ('Teststudie A', 'teststudie a')
         )
 
-        # Andere Großschreibung ergibt denselben Vergleichswert.
-        # Die Schreibweise des Anzeigenamens bleibt erhalten.
         self.assertEqual(
             pruefe_studienname('TESTSTUDIE A'),
             ('TESTSTUDIE A', 'teststudie a')
         )
 
-        # Innere Leerzeichen in beiden Werten erhalten.
         self.assertEqual(
             pruefe_studienname('Test  Studie'),
             ('Test  Studie', 'test  studie')
         )
 
-        # Ein einzelnes Zeichen erfüllt die Mindestlänge.
         self.assertEqual(
             pruefe_studienname('A'),
             ('A', 'a')
         )
 
-        # Genau 100 Zeichen nach der Bereinigung zulassen.
-        # Der Vergleichswert darf durch casefold länger werden: ß wird zu ss.
         self.assertEqual(
+            # casefold darf den Vergleichswert verlängern: ß wird zu ss.
             pruefe_studienname('  ' + 'ß' * 100 + '  '),
             ('ß' * 100, 'ss' * 100)
         )
 
     def test_fa07_ungueltiger_studienname_wird_abgewiesen(self):
-        # Leere Texte, überlange Namen und falsche Datentypen abweisen.
+        """Leere und überlange Studiennamen sowie unzulässige Datentypen werden abgewiesen."""
         for ungueltiger_name in ['', '   ', 'A' * 101, None, 123, True]:
             with self.subTest(wert=ungueltiger_name):
                 with self.assertRaises(ValidationError):
@@ -2161,9 +1867,10 @@ class StudiennameTests(SimpleTestCase):
 
 
 class StundenwertTests(SimpleTestCase):
+    """Prüft zulässige Stundenwerte und ihre Rückgabe als Fließkommazahl."""
 
     def test_fa07_gueltiger_stundenwert_wird_als_float_zurueckgegeben(self):
-        # Jeweils Eingabewert und erwarteten Rückgabewert festlegen.
+        """Zulässige positive Schritte von 0,5 VP-Stunden werden als float zurückgegeben."""
         testfaelle = [
             (0.5, 0.5),
             (1, 1.0),
@@ -2173,28 +1880,29 @@ class StundenwertTests(SimpleTestCase):
         ]
 
         for eingabe, erwartet in testfaelle:
-            # subTest verwenden, um jeden Testfall separat zu prüfen und die Fehlermeldung zu isolieren.
+            # Jeder Teilfall erhält bei einem Fehler eine eigene Fundstelle.
             with self.subTest(wert=eingabe):
                 ergebnis = pruefe_stundenwert(eingabe)
 
-                # Den Zahlenwert und den Rückgabetyp prüfen.
                 self.assertEqual(ergebnis, erwartet)
                 self.assertIsInstance(ergebnis, float)
 
     def test_fa07_ungueltiger_stundenwert_wird_abgewiesen(self):
-        # Null, negative Werte, falsche Schritte und Datentypen abweisen.
+        """Unzulässige Schritte, nicht positive Werte und falsche Datentypen werden abgewiesen."""
         for ungueltiger_wert in [
             0, -0.5, 0.25, 1.25, '1.5', '', None, True, False
         ]:
-            # subTest verwenden, um jeden ungültigen Wert separat zu prüfen und die Fehlermeldung zu isolieren.
+
             with self.subTest(wert=ungueltiger_wert):
                 with self.assertRaises(ValidationError):
                     pruefe_stundenwert(ungueltiger_wert)
 
 
 class StundenberechnungTests(SimpleTestCase):
+    """Prüft Stundensummen und Erfüllungsgrenzen ohne gespeicherte Modelldaten."""
 
     def test_fa16_leere_liste_liefert_nullsummen(self):
+        """Eine leere Teilnahmeliste liefert Fließkomma-Nullsummen und einen unerfüllten Status."""
         ergebnis = berechne_stunden([])
 
         self.assertEqual(ergebnis, {
@@ -2204,12 +1912,12 @@ class StundenberechnungTests(SimpleTestCase):
             "erfuellt": False,
         })
 
-        # Auch bei leerer Liste müssen die Summen Fließkommazahlen sein.
+        # Auch Nullsummen müssen den vereinbarten Zahlentyp behalten.
         for feldname in ["praesenzstunden", "onlinestunden", "gesamtstunden"]:
             self.assertIsInstance(ergebnis[feldname], float)
 
     def test_fa16_stunden_werden_nach_einordnung_addiert(self):
-        # Mehrere Teilnahmen je Einordnung prüfen das Aufsummieren.
+        """Mehrere Teilnahmen werden getrennt nach Einordnung und insgesamt addiert."""
         testfaelle = [
             (Untersuchung.PRAESENZ, 1.5),
             (Untersuchung.PRAESENZ, 2.5),
@@ -2220,7 +1928,7 @@ class StundenberechnungTests(SimpleTestCase):
         teilnahmen = []
 
         for einordnung, stundenwert in testfaelle:
-            # Die Modellobjekte bleiben ausschließlich im Arbeitsspeicher.
+            # Ohne save() bleiben diese Modellobjekte ausschließlich im Arbeitsspeicher.
             untersuchung = Untersuchung(
                 einordnung=einordnung,
                 stundenwert=stundenwert,
@@ -2237,7 +1945,7 @@ class StundenberechnungTests(SimpleTestCase):
         })
 
     def test_fa16_erfuellungsgrenzen_werden_beachtet(self):
-        # Präsenzstunden, Onlinestunden, erwartete Gesamtstunden und Status.
+        """Gesamt- und Präsenzminimum werden unabhängig und einschließlich der Grenzen geprüft."""
         testfaelle = [
             (15.0, 15.0, 30.0, True),    # Beide Mindestwerte genau erreicht.
             (15.0, 14.5, 29.5, False),   # Zu wenige Gesamtstunden.
@@ -2246,37 +1954,34 @@ class StundenberechnungTests(SimpleTestCase):
         ]
 
         for praesenzstunden, onlinestunden, gesamtstunden, erfuellt in testfaelle:
-            # subTest verwenden, um jeden Testfall separat zu prüfen und die Fehlermeldung zu isolieren.
             with self.subTest(
                 praesenzstunden=praesenzstunden,
                 onlinestunden=onlinestunden,
             ):
-                # Untersuchungen anlegen, die ausschließlich im Arbeitsspeicher existieren.
+
+                # Die Berechnung benötigt Modellobjekte, aber keine gespeicherten Datensätze.
                 praesenzuntersuchung = Untersuchung(
                     einordnung=Untersuchung.PRAESENZ,
                     stundenwert=praesenzstunden,
                 )
 
-                # Die Präsenz-Teilnahme wird der Liste hinzugefügt.
                 teilnahmen = [
                     Teilnahme(untersuchung=praesenzuntersuchung),
                 ]
 
-                # Bei null Onlinestunden gibt es keine Online-Teilnahme.
+                # Null Onlinestunden bedeuten hier, dass keine Online-Teilnahme vorliegt.
                 if onlinestunden > 0:
                     onlineuntersuchung = Untersuchung(
                         einordnung=Untersuchung.ONLINE,
                         stundenwert=onlinestunden,
                     )
-                    # Die Online-Teilnahme wird der Liste hinzugefügt.
+
                     teilnahmen.append(
                         Teilnahme(untersuchung=onlineuntersuchung)
                     )
 
-                # Die Stundenberechnung durchführen.
                 ergebnis = berechne_stunden(teilnahmen)
 
-                # Die erwarteten Summen und den Status prüfen.
                 self.assertEqual(ergebnis, {
                     "praesenzstunden": praesenzstunden,
                     "onlinestunden": onlinestunden,
@@ -2284,14 +1989,16 @@ class StundenberechnungTests(SimpleTestCase):
                     "erfuellt": erfuellt,
                 })
 
-                # Der Status muss tatsächlich True beziehungsweise False sein.
+                # Identität prüft zusätzlich den bool-Typ statt nur die Gleichheit mit 0 oder 1.
                 self.assertIs(ergebnis["erfuellt"], erfuellt)
 
 
 class TeilnahmesucheTests(TestCase):
+    """Prüft Auswahl, Sortierung und mitgeladene Untersuchungsangaben."""
 
     def setUp(self):
-        # Untersuchungen bewusst entgegen der erwarteten Sortierung anlegen.
+        """Legt sortierbare Teilnahmen und einen fremden Eintrag als Vergleich an."""
+        # Entgegen der Namensreihenfolge anlegen, damit eine fehlende Sortierung auffällt.
         untersuchung_beta = Untersuchung.objects.create(
             studienname="Beta",
             studienname_vergleich="beta",
@@ -2308,7 +2015,6 @@ class TeilnahmesucheTests(TestCase):
             lehrperson="Testlehrperson Alpha",
         )
 
-        # Zwei Teilnahmen der gesuchten Matrikelnummer speichern.
         self.teilnahme_beta = Teilnahme.objects.create(
             untersuchung=untersuchung_beta,
             matrikelnummer="1234567",
@@ -2319,25 +2025,23 @@ class TeilnahmesucheTests(TestCase):
             matrikelnummer="1234567",
         )
 
-        # Diese Teilnahme darf bei der Suche nicht erscheinen.
+        # Eine fremde Matrikelnummer darf weder Suche noch Berechnung beeinflussen.
         Teilnahme.objects.create(
             untersuchung=untersuchung_beta,
             matrikelnummer="7654321",
         )
 
     def test_fa14_passende_teilnahmen_werden_sortiert_geladen(self):
+        """Die Suche liefert passende Teilnahmen sortiert und ohne weitere Nachladeabfragen."""
         teilnahmen = suche_teilnahmen("1234567")
 
-        # Eine Liste mit ausschließlich den passenden Teilnahmen erwarten.
-        # Die Reihenfolge richtet sich nach dem Studiennamenvergleich.
         self.assertIsInstance(teilnahmen, list)
         self.assertEqual(
             teilnahmen,
             [self.teilnahme_alpha, self.teilnahme_beta],
         )
 
-        # Die Untersuchungen müssen bereits vollständig mitgeladen sein.
-        # Ihre Angaben erstmals innerhalb dieses Prüfblocks lesen.
+        # Untersuchungsangaben erstmals hier lesen: Dabei darf keine weitere Abfrage entstehen.
         with self.assertNumQueries(0):
             self.assertEqual(
                 teilnahmen[0].untersuchung.studienname,
@@ -2358,8 +2062,6 @@ class TeilnahmesucheTests(TestCase):
 
             berechnung = berechne_stunden(teilnahmen)
 
-        # Die Berechnung verwendet Stundenwerte und Einordnungen
-        # der mitgeladenen Untersuchungen.
         self.assertEqual(berechnung, {
             "praesenzstunden": 2.5,
             "onlinestunden": 1.5,
@@ -2368,26 +2070,17 @@ class TeilnahmesucheTests(TestCase):
         })
 
     def test_fa14_fehlende_matrikelnummer_liefert_leere_liste(self):
-        # Trotz vorhandener anderer Teilnahmen gibt es keinen Treffer.
+        """Eine unbekannte Matrikelnummer liefert trotz anderer Teilnahmen eine leere Liste."""
         ergebnis = suche_teilnahmen("9999999")
 
         self.assertEqual(ergebnis, [])
 
 
-# TestCase unterstützt Tests mit Datenbankzugriff und stellt Prüfmethoden
-# wie assertEqual bereit. Der Testrunner verwendet eine eigene Testdatenbank.
-# TestCase setzt die Datenbankänderungen nach jedem einzelnen Test zurück.
 class UntersuchungskorrekturTests(TestCase):
+    """Prüft Korrekturen, Namenskonflikte und unveränderte Bestände bei Fehlern."""
 
     def setUp(self):
-        # setUp wird automatisch vor jeder Testmethode aufgerufen.
-        # Dadurch beginnen die Tests mit demselben vorbereiteten Bestand.
-        #
-        # self bezeichnet die aktuelle Testinstanz. Über self gespeicherte
-        # Objekte sind auch in deren anderen Methoden verfügbar.
-        #
-        # objects.create erzeugt ein Modellobjekt, speichert es sofort
-        # in der Testdatenbank und gibt das gespeicherte Objekt zurück.
+        """Legt zwei Untersuchungen, zugehörige Teilnahmen und feste Vergleichsbestände an."""
         self.untersuchung = Untersuchung.objects.create(
             studienname="Ausgangsstudie",
             studienname_vergleich="ausgangsstudie",
@@ -2396,8 +2089,7 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="Alte Lehrperson",
         )
 
-        # Eine zweite Untersuchung ermöglicht die Prüfung von Namenskonflikten.
-        # Außerdem wird geprüft, dass die Korrektur keine zusätzlichen Untersuchungen anlegt.
+        # Die zweite Untersuchung macht Konflikte mit bereits vergebenen Namen prüfbar.
         self.andere_untersuchung = Untersuchung.objects.create(
             studienname="Andere Studie",
             studienname_vergleich="andere studie",
@@ -2406,34 +2098,25 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="Andere Lehrperson",
         )
 
-        # Zwei verschiedene Matrikelnummern derselben Untersuchung zuordnen.
-        # Die Übergabe des Untersuchungsobjekts stellt die Fremdschlüsselverbindung zwischen Teilnahme und Untersuchung her.
         for matrikelnummer in ["1234567", "7654321"]:
             Teilnahme.objects.create(
                 untersuchung=self.untersuchung,
                 matrikelnummer=matrikelnummer,
             )
 
-        # Den ursprünglichen Uploadzeitpunkt für einen späteren Vergleich merken.
         self.uploadzeitpunkt = self.untersuchung.uploadzeitpunkt
 
-        # Den vollständigen Ausgangsbestand als Feldwerte festhalten:
-        # - order_by("pk") sortiert aufsteigend nach dem Primärschlüssel.
-        # - values() liefert je Datensatz ein Dictionary mit seinen Feldwerten.
-        # - list() führt die Abfrage sofort aus und hält den jetzigen Stand fest.
-        #
-        # Dadurch werden spätere Datenbankwerte mit einem bereits bereits gelesenen Ausgangsstand verglichen.
+        # Feldwerte sofort als Liste festhalten, einschließlich IDs und Uploadzeitpunkt.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
 
-        # Bei Teilnahmen enthalten die Feldwerte auch untersuchung_id.
-        # Der Vergleich erfasst damit IDs, Matrikelnummern und Zuordnungen.
         self.teilnahmebestand = list(
             Teilnahme.objects.order_by("pk").values()
         )
 
     def test_fa15_gueltige_korrektur_wird_gespeichert(self):
+        """Eine gültige Korrektur ändert Untersuchungsangaben und erhält Identität und Teilnahmen."""
         ergebnis, fehlerliste = korrigiere_untersuchung(
             untersuchung_id=self.untersuchung.pk,
             studienname="  Neue Studie ",
@@ -2442,64 +2125,48 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="  Neue Lehrperson  ",
         )
 
-        # Die Korrektur muss erfolgreich sein und keine Fehler zurückgeben.
         self.assertEqual(fehlerliste, [])
 
-        # Die Rückgabe muss ein Untersuchung-Objekt sein.
         self.assertIsInstance(ergebnis, Untersuchung)
 
-        # Die Rückgabe muss dieselbe Untersuchung wie die Ausgangsuntersuchung sein.
         self.assertEqual(ergebnis.pk, self.untersuchung.pk)
 
-        # Die Rückgabe muss die neuen Werte enthalten.
         self.assertEqual(ergebnis.studienname, "Neue Studie")
 
-        # Die Korrekturfunktion hat eine eigene Instanz aus der Datenbank geladen.
-        # Das Objekt aus setUp enthält deshalb zunächst noch die alten Werte.
-        # refresh_from_db aktualisiert dieses Objekt mit den Datenbankwerten.
-        # So wird geprüft , was tatsächlich gespeichert wurde.
+        # Neu aus der Datenbank laden, damit tatsächlich gespeicherte Werte geprüft werden.
         self.untersuchung.refresh_from_db()
 
-        # Anzeigenamen und zugehörigen Vergleichswert prüfen.
         self.assertEqual(self.untersuchung.studienname, "Neue Studie")
         self.assertEqual(
             self.untersuchung.studienname_vergleich,
             "neue studie",
         )
 
-        # Gespeicherten Stundenwert, Einordnung und bereinigten Lehrnamen prüfen.
         self.assertEqual(self.untersuchung.stundenwert, 2.5)
         self.assertEqual(self.untersuchung.einordnung, Untersuchung.ONLINE)
         self.assertEqual(self.untersuchung.lehrperson, "Neue Lehrperson")
 
-        # Der erstmalige Uploadzeitpunkt muss bei einer Korrektur erhalten bleiben.
         self.assertEqual(
             self.untersuchung.uploadzeitpunkt,
             self.uploadzeitpunkt,
         )
 
-        # Den aktuellen Teilnahmebestand mit dem Ausgangsbestand vergleichen.
-        # Alle bisherigen Teilnahmen müssen weiterhin unverändert auf dieselbe Untersuchung verweisen.
         self.assertEqual(
             list(Teilnahme.objects.order_by("pk").values()),
             self.teilnahmebestand,
         )
 
-        # count() zählt die gespeicherten Untersuchungen.
-        # Eine Korrektur darf keine zusätzliche Untersuchung anlegen.
         self.assertEqual(Untersuchung.objects.count(), 2)
 
-        # Im Ausgangsbestand wurde die andere Untersuchung als zweite angelegt und besitzt die größere ID. Sie muss unverändert bleiben.
+        # Die zweite, später angelegte Untersuchung muss vollständig unverändert bleiben.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values())[1],
             self.untersuchungsbestand[1],
         )
 
     def test_fa15_eigener_studienname_bleibt_erlaubt(self):
-        # Der neue Anzeigename verwendet eine andere Großschreibung.
-        # Sein Vergleichswert bleibt jedoch "ausgangsstudie".
-        # Die bearbeitete Untersuchung muss beim Namensvergleich ausgeschlossen
-        # werden, damit ihr eigener Name keinen Konflikt auslöst.
+        """Eine andere Schreibweise des eigenen Studiennamens löst keinen Namenskonflikt aus."""
+        # Der eigene Vergleichswert darf beim Namensabgleich keinen Konflikt auslösen.
         ergebnis, fehlerliste = korrigiere_untersuchung(
             untersuchung_id=self.untersuchung.pk,
             studienname="  AUSGANGSSTUDIE  ",
@@ -2508,16 +2175,12 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="Neue Lehrperson",
         )
 
-        # Erfolgreiche Rückgabe und unveränderte Identität prüfen.
         self.assertEqual(fehlerliste, [])
         self.assertIsInstance(ergebnis, Untersuchung)
         self.assertEqual(ergebnis.pk, self.untersuchung.pk)
 
-        # Die gespeicherten Werte erneut in die Testinstanz laden.
         self.untersuchung.refresh_from_db()
 
-        # Die neue Schreibweise muss gespeichert sein.
-        # Der interne Vergleichswert bleibt trotz anderer Großschreibung gleich.
         self.assertEqual(self.untersuchung.studienname, "AUSGANGSSTUDIE")
         self.assertEqual(
             self.untersuchung.studienname_vergleich,
@@ -2526,7 +2189,7 @@ class UntersuchungskorrekturTests(TestCase):
         self.assertEqual(self.untersuchung.stundenwert, 1.5)
 
     def test_fa15_ungueltige_angaben_werden_gemeinsam_abgewiesen(self):
-        # Alle vier bearbeitbaren Angaben sind gleichzeitig ungültig.
+        """Vier ungültige Angaben werden gemeinsam gemeldet, ohne den Bestand zu ändern."""
         ergebnis, fehlerliste = korrigiere_untersuchung(
             untersuchung_id=self.untersuchung.pk,
             studienname="",
@@ -2535,27 +2198,18 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="   ",
         )
 
-        # Die Korrektur muss fehlschlagen und Fehlermeldungen zurückgeben.
         self.assertIsNone(ergebnis)
 
-        # Es müssen vier Fehlermeldungen zurückgegeben werden.
         self.assertEqual(len(fehlerliste), 4)
 
-        # join() verbindet die Meldungen zu einem Text.
-        # Das Leerzeichen vor .join dient als Trennzeichen zwischen den Meldungen.
         meldungen = " ".join(fehlerliste)
 
+        # subTest kennzeichnet Fehler je Feld und führt die übrigen Einzelprüfungen fort.
         for feldname in ["Studienname", "Stundenwert", "Einordnung", "Lehrperson"]:
-            # subTest kennzeichnet jede Einzelprüfung mit dem aktuellen Feldnamen.
-            # Nach einer fehlgeschlagenen Einzelprüfung können die übrigen
-            # Feldnamen weiterhin geprüft werden.
             with self.subTest(feldname=feldname):
                 self.assertIn(f"{feldname}:", meldungen)
 
-        # Alle Untersuchungen und Teilnahmen müssen dem Ausgangsstand entsprechen.
-        # Die Dictionaries enthalten auch IDs und den Uploadzeitpunkt.
         self.assertEqual(
-            # list() führt die Abfrage sofort aus und hält den jetzigen Stand fest.
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
         )
@@ -2565,9 +2219,8 @@ class UntersuchungskorrekturTests(TestCase):
         )
 
     def test_fa15_name_einer_anderen_untersuchung_wird_abgewiesen(self):
-        # Der Name gehört bereits zur zweiten Untersuchung.
-        # Großschreibung und äußere Leerzeichen müssen beim Vergleich
-        # entsprechend der bestehenden Studiennamenprüfung behandelt werden.
+        """Der Name einer anderen Untersuchung wird auch in abweichender Schreibweise abgewiesen."""
+        # Großschreibung und äußere Leerzeichen dürfen den Namenskonflikt nicht verdecken.
         ergebnis, fehlerliste = korrigiere_untersuchung(
             untersuchung_id=self.untersuchung.pk,
             studienname="  ANDERE STUDIE  ",
@@ -2579,10 +2232,8 @@ class UntersuchungskorrekturTests(TestCase):
         self.assertIsNone(ergebnis)
         self.assertEqual(len(fehlerliste), 1)
 
-        # Die Fehlermeldung muss den Konflikt mit dem Studiennamen deutlich machen.
         self.assertTrue(fehlerliste[0].startswith("Studienname:"))
 
-        # Die Untersuchung darf nicht verändert werden.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2593,15 +2244,14 @@ class UntersuchungskorrekturTests(TestCase):
         )
 
     def test_fa15_fehlende_untersuchung_wird_abgewiesen(self):
-        # Eine mögliche freie ID bilden und ihre Abwesenheit ausdrücklich prüfen.
+        """Eine fehlende Untersuchungs-ID führt zu einer kontrollierten Abweisung ohne Änderungen."""
+        # Eine freie ID ableiten und ausdrücklich prüfen, dass sie nicht belegt ist.
         fehlende_id = self.andere_untersuchung.pk + 1
 
-        # Die gewählte ID darf nicht in der Datenbank existieren.
         self.assertFalse(
             Untersuchung.objects.filter(pk=fehlende_id).exists()
         )
 
-        # Die Funktion muss eine Fehlermeldung zurückgeben, wenn die Untersuchung nicht existiert, trotz gültiger Eingaben. Die Meldung muss die fehlende Untersuchung eindeutig benennen.
         ergebnis, fehlerliste = korrigiere_untersuchung(
             untersuchung_id=fehlende_id,
             studienname="Neue Studie",
@@ -2610,12 +2260,10 @@ class UntersuchungskorrekturTests(TestCase):
             lehrperson="Neue Lehrperson",
         )
 
-        # Eine kontrollierte Fehlerrückgabe mit Bezug zur Untersuchung erwarten.
         self.assertIsNone(ergebnis)
         self.assertEqual(len(fehlerliste), 1)
         self.assertTrue(fehlerliste[0].startswith("Untersuchung:"))
 
-        # Eine fehlende Untersuchung darf weder neue Daten anlegen noch vorhandene Untersuchungen oder Teilnahmen verändern.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2626,10 +2274,8 @@ class UntersuchungskorrekturTests(TestCase):
         )
 
     def test_fa15_speicherfehler_wird_kontrolliert_behandelt(self):
-        # Untersuchung.save wird innerhalb des with-Blocks vorübergehend ersetzt.
-        # side_effect löst bei jedem Aufruf den angegebenen DatabaseError aus.
-        # So lässt sich die Fehlerbehandlung prüfen, ohne die echte Speichermethode auszuführen.
-        # Beim Verlassen des Blocks wird die ursprüngliche Methode wiederhergestellt.
+        """Ein Speicherfehler wird kontrolliert gemeldet und erhält den ursprünglichen Bestand."""
+        # side_effect löst nur im Block einen Speicherfehler aus, ohne Daten zu schreiben.
         with patch.object(
             Untersuchung,
             "save",
@@ -2643,16 +2289,14 @@ class UntersuchungskorrekturTests(TestCase):
                 lehrperson="Neue Lehrperson",
             )
 
-        # Sicherstellen, dass die Funktion tatsächlich zu speichern versucht hat.
+        # Der Test muss den vorgesehenen Speicheraufruf tatsächlich erreicht haben.
         speichern.assert_called_once()
 
-        # Die Funktion muss den Fehler abfangen und kontrolliert zurückgeben.
         self.assertIsNone(ergebnis)
         self.assertEqual(fehlerliste, [
             "Untersuchung: Die Änderungen konnten nicht gespeichert werden."
         ])
 
-        # Der gespeicherte Untersuchungs- und Teilnahmebestand bleibt erhalten.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2664,9 +2308,10 @@ class UntersuchungskorrekturTests(TestCase):
 
 
 class TeilnahmedatenLoeschungTests(TestCase):
+    """Prüft Löschvoraussetzungen, verbleibende Daten und Transaktionsrücknahme."""
 
     def setUp(self):
-        # Vor jeder Testmethode denselben synthetischen Bestand anlegen.
+        """Legt einen erfüllten synthetischen Bestand und feste Vergleichswerte an."""
         self.matrikelnummer = "1234567"
 
         self.praesenzuntersuchung = Untersuchung.objects.create(
@@ -2685,7 +2330,7 @@ class TeilnahmedatenLoeschungTests(TestCase):
             lehrperson="Testlehrperson Online",
         )
 
-        # Beide Teilnahmen zusammen erfüllen die Mindestvorgaben.
+        # Beide Teilnahmen zusammen erfüllen Gesamt- und Präsenzstundengrenze.
         for untersuchung in [
             self.praesenzuntersuchung,
             self.onlineuntersuchung,
@@ -2695,8 +2340,7 @@ class TeilnahmedatenLoeschungTests(TestCase):
                 matrikelnummer=self.matrikelnummer,
             )
 
-        # Die vollständigen gespeicherten Feldwerte festhalten.
-        # Damit können spätere unbeabsichtigte Änderungen erkannt werden.
+        # Alle Feldwerte festhalten, um auch unbemerkte Änderungen bei gleicher Anzahl zu erkennen.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -2705,6 +2349,7 @@ class TeilnahmedatenLoeschungTests(TestCase):
         )
 
     def test_fa18_erfuellte_teilnahmen_werden_geloescht(self):
+        """Bestätigte, erfüllte Teilnahmen und dadurch leere Untersuchungen werden gelöscht."""
         fehlerliste = loesche_teilnahmedaten(
             matrikelnummer=self.matrikelnummer,
             ablage_bestaetigt=True,
@@ -2712,13 +2357,11 @@ class TeilnahmedatenLoeschungTests(TestCase):
 
         self.assertEqual(fehlerliste, [])
 
-        # Beide Teilnahmen und beide dadurch leeren Untersuchungen fehlen.
         self.assertEqual(Teilnahme.objects.count(), 0)
         self.assertEqual(Untersuchung.objects.count(), 0)
 
     def test_fa18_ohne_ablagebestaetigung_bleibt_bestand_erhalten(self):
-        # Die Mindestvorgaben sind erfüllt.
-        # Ausschließlich die Bestätigung der externen Reportablage fehlt.
+        """Ohne Bestätigung der externen Reportablage bleiben alle Daten erhalten."""
         fehlerliste = loesche_teilnahmedaten(
             matrikelnummer=self.matrikelnummer,
             ablage_bestaetigt=False,
@@ -2726,7 +2369,6 @@ class TeilnahmedatenLoeschungTests(TestCase):
 
         self.assertTrue(fehlerliste)
 
-        # Sämtliche gespeicherten Angaben müssen unverändert bleiben.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2737,12 +2379,12 @@ class TeilnahmedatenLoeschungTests(TestCase):
         )
 
     def test_fa18_aktuell_zu_wenige_gesamtstunden_verhindern_loeschung(self):
-        # Den zunächst erfüllten Bestand nachträglich verändern.
-        # Danach liegen 29,5 Gesamtstunden und weiterhin 15 Präsenzstunden vor.
+        """Nachträglich gesunkene Gesamtstunden verhindern die Löschung."""
+        # 29,5 Gesamtstunden unterschreiten nur die Gesamtstundengrenze.
         self.onlineuntersuchung.stundenwert = 14.5
         self.onlineuntersuchung.save(update_fields=["stundenwert"])
 
-        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        # Die vorbereitete Änderung gehört zum neuen Vergleichsstand.
         untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -2752,24 +2394,21 @@ class TeilnahmedatenLoeschungTests(TestCase):
             ablage_bestaetigt=True,
         )
 
-        # Die Löschung muss abgelehnt werden, da die Mindestvorgaben nicht erfüllt sind.
         self.assertTrue(fehlerliste)
 
-        # Alle gespeicherten Angaben müssen unverändert bleiben.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             untersuchungsbestand,
         )
 
-        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
         self.assertEqual(
             list(Teilnahme.objects.order_by("pk").values()),
             self.teilnahmebestand,
         )
 
     def test_fa18_aktuell_zu_wenige_praesenzstunden_verhindern_loeschung(self):
-        # Die bisherige Präsenzuntersuchung nachträglich als online einordnen.
-        # Die Gesamtstunden bleiben bei 30, die Präsenzstunden sinken auf 0.
+        """Zu wenige aktuelle Präsenzstunden verhindern trotz ausreichender Gesamtstunden die Löschung."""
+        # Online einordnen: 30 Gesamtstunden bleiben erhalten, Präsenzstunden sinken auf 0.
         self.praesenzuntersuchung.einordnung = Untersuchung.ONLINE
         self.praesenzuntersuchung.save(update_fields=["einordnung"])
 
@@ -2782,25 +2421,22 @@ class TeilnahmedatenLoeschungTests(TestCase):
             ablage_bestaetigt=True,
         )
 
-        # Die Löschung muss abgelehnt werden, da die Mindestvorgaben nicht erfüllt sind.
         self.assertTrue(fehlerliste)
 
-        # Alle gespeicherten Angaben müssen unverändert bleiben.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             untersuchungsbestand,
         )
 
-        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
         self.assertEqual(
             list(Teilnahme.objects.order_by("pk").values()),
             self.teilnahmebestand,
         )
 
     def test_fa18_fehlende_matrikelnummer_veraendert_keine_daten(self):
+        """Eine Matrikelnummer ohne Teilnahmen führt zu einer Abweisung ohne Änderungen."""
         fehlende_matrikelnummer = "9999999"
 
-        # Die Abwesenheit der gewählten Matrikelnummer ausdrücklich prüfen.
         self.assertFalse(
             Teilnahme.objects.filter(
                 matrikelnummer=fehlende_matrikelnummer,
@@ -2812,29 +2448,26 @@ class TeilnahmedatenLoeschungTests(TestCase):
             ablage_bestaetigt=True,
         )
 
-        # Die Löschung muss abgelehnt werden, da keine Teilnahmen gefunden wurden.
         self.assertTrue(fehlerliste)
 
-        # Alle gespeicherten Angaben müssen unverändert bleiben.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
         )
 
-        # Alle Teilnahmen müssen weiterhin unverändert vorhanden sein.
         self.assertEqual(
             list(Teilnahme.objects.order_by("pk").values()),
             self.teilnahmebestand,
         )
 
     def test_fa18_untersuchung_mit_fremder_teilnahme_bleibt_erhalten(self):
-        # Eine andere Matrikelnummer derselben Onlineuntersuchung zuordnen.
+        """Eine Untersuchung mit einer fremden Teilnahme bleibt bei der Löschung erhalten."""
         fremde_teilnahme = Teilnahme.objects.create(
             untersuchung=self.onlineuntersuchung,
             matrikelnummer="7654321",
         )
 
-        # Genau diese Untersuchung und diese Teilnahme müssen erhalten bleiben.
+        # Nur die fremde Teilnahme und ihre weiterhin benötigte Untersuchung müssen verbleiben.
         verbleibender_untersuchungsbestand = list(
             Untersuchung.objects.filter(
                 pk=self.onlineuntersuchung.pk,
@@ -2853,9 +2486,6 @@ class TeilnahmedatenLoeschungTests(TestCase):
 
         self.assertEqual(fehlerliste, [])
 
-        # Der vollständige Restbestand muss den erwarteten Feldwerten entsprechen.
-        # Damit fehlen zugleich beide Teilnahmen der gelöschten Matrikelnummer
-        # und die dadurch leer gewordene Präsenzuntersuchung.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             verbleibender_untersuchungsbestand,
@@ -2865,11 +2495,9 @@ class TeilnahmedatenLoeschungTests(TestCase):
             verbleibender_teilnahmebestand,
         )
 
-
     def test_fa18_datenbankfehler_setzt_teilnahmeloeschung_zurueck(self):
-        # Der Untersuchungszugriff erfolgt im aktuellen Code erst,
-        # nachdem die Teilnahmen gelöscht wurden.
-        # An dieser Stelle einen synthetischen Datenbankfehler auslösen.
+        """Ein nachgelagerter Datenbankfehler nimmt die bereits erfolgte Teilnahmelöschung zurück."""
+        # Erst nach der Teilnahmelöschung einen Fehler beim Untersuchungszugriff auslösen.
         with patch.object(
             Untersuchung.objects,
             "filter",
@@ -2880,15 +2508,13 @@ class TeilnahmedatenLoeschungTests(TestCase):
                 ablage_bestaetigt=True,
             )
 
-        # Der vorgesehene Fehlerpunkt muss tatsächlich erreicht worden sein.
         untersuchungsabfrage.assert_called_once()
 
         self.assertEqual(fehlerliste, [
             "Die Teilnahmedaten konnten nicht gelöscht werden."
         ])
 
-        # Die bereits gelöschten Teilnahmen müssen zurückgesetzt worden sein.
-        # Der vollständige Bestand entspricht wieder dem Ausgangszustand.
+        # Die Transaktion muss auch die bereits gelöschten Teilnahmen wiederherstellen.
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2900,9 +2526,10 @@ class TeilnahmedatenLoeschungTests(TestCase):
 
 
 class TeilnahmedatenLoeschungViewTests(TestCase):
+    """Prüft Löschanfragen, Rollenrechte und die Bestätigung der Reportablage."""
 
     def setUp(self):
-        # Vor jedem Test einen erfüllten synthetischen Datenbestand anlegen.
+        """Legt einen erfüllten Datenbestand und feste Vergleichswerte für Löschanfragen an."""
         self.matrikelnummer = "1234567"
 
         self.untersuchung = Untersuchung.objects.create(
@@ -2918,7 +2545,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
             matrikelnummer=self.matrikelnummer,
         )
 
-        # Die gespeicherten Feldwerte für spätere Vergleiche festhalten.
+        # Den vollständigen Bestand vor der Anfrage als feste Feldwerte sichern.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -2927,7 +2554,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         )
 
     def melde_testkonto_an(self, rolle):
-        # Ein synthetisches Konto mit der übergebenen Rolle anlegen.
+        """Legt ein synthetisches Rollenkonto an und richtet seine Sitzung per Anmeldung ein."""
         benutzername = "testkonto"
         passwort = "a" * 64
 
@@ -2939,7 +2566,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die reguläre Anmeldung richtet auch die Sitzungszeitwerte ein.
+        # Die reguläre Anmeldung richtet zugleich die erforderlichen Sitzungszeitwerte ein.
         antwort = self.client.post(
             "/anmelden/",
             data={
@@ -2951,7 +2578,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.assertTrue(antwort.json()["erfolg"])
 
     def pruefe_unveraenderten_bestand(self):
-        # Alle Untersuchungs- und Teilnahmeangaben müssen erhalten bleiben.
+        """Vergleicht sämtliche gespeicherten Feldwerte mit dem vorbereiteten Bestand."""
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -2962,6 +2589,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         )
 
     def test_fa18_administrator_kann_teilnahmedaten_loeschen(self):
+        """Ein Administrationskonto kann bei erfüllten Voraussetzungen die Daten löschen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.post(
@@ -2975,14 +2603,14 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.assertEqual(antwort.status_code, 200)
         self.assertTrue(antwort.json()["erfolg"])
 
-        # Die Teilnahme und die dadurch leere Untersuchung müssen fehlen.
         self.assertEqual(Teilnahme.objects.count(), 0)
         self.assertEqual(Untersuchung.objects.count(), 0)
 
     def test_qa04_lehrperson_kann_keine_teilnahmedaten_loeschen(self):
+        """Eine Lehrperson darf trotz erfüllter Löschvoraussetzungen keine Daten löschen."""
         self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
 
-        # Alle Löschvoraussetzungen außer der berechtigten Rolle liegen vor.
+        # Gültige Löschdaten isolieren die fehlende Rollenberechtigung als Abweisungsgrund.
         antwort = self.client.post(
             "/teilnahmedaten_loeschen/",
             data={
@@ -2996,7 +2624,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_qa04_loeschung_ohne_anmeldung_wird_abgewiesen(self):
-        # Der Testclient wurde in diesem Test nicht angemeldet.
+        """Eine nicht angemeldete Löschanfrage wird ohne Datenänderung abgewiesen."""
         antwort = self.client.post(
             "/teilnahmedaten_loeschen/",
             data={
@@ -3010,6 +2638,7 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa18_get_anfrage_wird_abgewiesen(self):
+        """Eine GET-Anfrage wird abgewiesen und weist POST als erlaubte Methode aus."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.get("/teilnahmedaten_loeschen/")
@@ -3017,15 +2646,14 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.assertEqual(antwort.status_code, 405)
         self.assertFalse(antwort.json()["erfolg"])
 
-        # Der Antwortheader nennt ausschließlich POST als erlaubte Methode.
         self.assertEqual(antwort.headers["Allow"], "POST")
         self.pruefe_unveraenderten_bestand()
 
     def test_fa18_fehlende_matrikelnummer_wird_abgewiesen(self):
+        """Eine fehlende Matrikelnummer wird vor dem Aufruf der Löschfunktion abgewiesen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Die in der View verwendete Löschfunktion vorübergehend ersetzen,
-        # um einen möglichen Aufruf zu erfassen.
+        # Der Mock erfasst, ob die View trotz fehlender Matrikelnummer die Löschung aufruft.
         with patch(
             "vp_stunden.views.loesche_teilnahmedaten"
         ) as loeschfunktion:
@@ -3039,14 +2667,14 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
         self.assertEqual(antwort.status_code, 400)
         self.assertFalse(antwort.json()["erfolg"])
 
-        # Die fehlende Angabe muss bereits in der View abgefangen werden.
         loeschfunktion.assert_not_called()
         self.pruefe_unveraenderten_bestand()
 
     def test_fa18_ohne_ablagebestaetigung_wird_loeschung_abgewiesen(self):
+        """Eine fehlende oder ausdrücklich verneinte Ablagebestätigung verhindert die Löschung."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Sowohl ein fehlendes Feld als auch den Formulartext "false" prüfen.
+        # Ein fehlendes Feld und der Formulartext "false" müssen beide die Löschung verhindern.
         testfaelle = [
             {
                 "matrikelnummer": self.matrikelnummer,
@@ -3070,13 +2698,13 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
                 self.pruefe_unveraenderten_bestand()
 
     def test_fa18_nicht_erfuellte_mindestvorgaben_verhindern_loeschung(self):
+        """Aktuell unterschrittene Mindestvorgaben verhindern die Löschung über die View."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Den gespeicherten Stundenwert unter die Gesamtstundengrenze senken.
         self.untersuchung.stundenwert = 29.5
         self.untersuchung.save(update_fields=["stundenwert"])
 
-        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        # Die vorbereitete Änderung gehört zum neuen Vergleichsstand.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -3096,11 +2724,13 @@ class TeilnahmedatenLoeschungViewTests(TestCase):
 
 
 class TeilnahmesucheViewTests(TestCase):
+    """Prüft Suchantworten, Stundenberechnung und Zugriffsabweisungen."""
 
     def setUp(self):
+        """Legt einen erfüllten Suchbestand, eine fremde Teilnahme und Vergleichswerte an."""
         self.matrikelnummer = "1234567"
 
-        # Untersuchungen bewusst entgegen der erwarteten A–Z-Reihenfolge anlegen.
+        # Entgegen der Namensreihenfolge anlegen, damit eine fehlende Sortierung auffällt.
         self.untersuchung_beta = Untersuchung.objects.create(
             studienname="Beta-Studie",
             studienname_vergleich="beta-studie",
@@ -3117,14 +2747,12 @@ class TeilnahmesucheViewTests(TestCase):
             lehrperson="Testlehrperson Alpha",
         )
 
-        # Einen bekannten Testzeitpunkt ohne Mikrosekunden verwenden.
-        # Dadurch lässt sich der Zeitpunkt nach der JSON-Ausgabe einfach vergleichen.
+        # Ohne Mikrosekunden lässt sich der gespeicherte Zeitpunkt mit der JSON-Ausgabe vergleichen.
         self.uploadzeitpunkt = timezone.now().replace(microsecond=0)
         Untersuchung.objects.update(
             uploadzeitpunkt=self.uploadzeitpunkt,
         )
 
-        # Beide Untersuchungen der gesuchten Matrikelnummer zuordnen.
         for untersuchung in [
             self.untersuchung_beta,
             self.untersuchung_alpha,
@@ -3134,12 +2762,13 @@ class TeilnahmesucheViewTests(TestCase):
                 matrikelnummer=self.matrikelnummer,
             )
 
-        # Diese fremde Teilnahme darf nicht im Suchergebnis erscheinen.
+        # Die fremde Teilnahme darf weder Suchergebnis noch Stundensummen beeinflussen.
         Teilnahme.objects.create(
             untersuchung=self.untersuchung_beta,
             matrikelnummer="7654321",
         )
 
+        # Alle Feldwerte vor der Anfrage festhalten, um unbeabsichtigte Änderungen zu erkennen.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -3148,6 +2777,7 @@ class TeilnahmesucheViewTests(TestCase):
         )
 
     def melde_testkonto_an(self, rolle):
+        """Legt ein synthetisches Rollenkonto an und richtet seine Sitzung per Anmeldung ein."""
         benutzername = "testkonto"
         passwort = "a" * 64
 
@@ -3159,7 +2789,7 @@ class TeilnahmesucheViewTests(TestCase):
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die reguläre Anmeldung richtet auch die Sitzungszeitwerte ein.
+        # Die reguläre Anmeldung richtet zugleich die erforderlichen Sitzungszeitwerte ein.
         antwort = self.client.post(
             "/anmelden/",
             data={
@@ -3172,7 +2802,7 @@ class TeilnahmesucheViewTests(TestCase):
         self.assertTrue(antwort.json()["erfolg"])
 
     def pruefe_unveraenderten_bestand(self):
-        # Eine Suche darf die gespeicherten VP-Daten nicht verändern.
+        """Vergleicht sämtliche gespeicherten Feldwerte mit dem vorbereiteten Bestand."""
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -3183,6 +2813,7 @@ class TeilnahmesucheViewTests(TestCase):
         )
 
     def test_fa14_administrator_erhaelt_sortierte_teilnahmen(self):
+        """Die Suchantwort enthält passende Teilnahmen in Namensreihenfolge und ihre Stundensummen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.post(
@@ -3196,7 +2827,6 @@ class TeilnahmesucheViewTests(TestCase):
         ergebnis = antwort.json()
         self.assertTrue(ergebnis["erfolg"])
 
-        # Genau die beiden Teilnahmen der gesuchten Matrikelnummer erwarten.
         self.assertEqual(len(ergebnis["teilnahmen"]), 2)
 
         erwartete_untersuchungen = [
@@ -3204,8 +2834,7 @@ class TeilnahmesucheViewTests(TestCase):
             self.untersuchung_beta,
         ]
 
-        # Jede Antwortzeile mit der Untersuchung an der erwarteten Position verbinden.
-        # Damit werden zugleich Reihenfolge und Feldzuordnung geprüft.
+        # zip verbindet jede Antwortzeile mit ihrer erwarteten Untersuchung und Position.
         for zeile, untersuchung in zip(
             ergebnis["teilnahmen"],
             erwartete_untersuchungen,
@@ -3232,13 +2861,12 @@ class TeilnahmesucheViewTests(TestCase):
                     untersuchung.lehrperson,
                 )
 
-                # datetime.fromisoformat(...) wandelt den Uploadzeitpunkt aus der JSON-Antwort von einer Zeichenfolge in einen Zeitpunkt um.
+                # Den JSON-Text für den Vergleich zurück in einen Zeitpunkt umwandeln.
                 self.assertEqual(
                     datetime.fromisoformat(zeile["uploadzeitpunkt"]),
                     self.uploadzeitpunkt,
                 )
 
-        # Die fremde Teilnahme darf auch die Berechnung nicht beeinflussen.
         self.assertEqual(ergebnis["berechnung"], {
             "praesenzstunden": 15.0,
             "onlinestunden": 15.0,
@@ -3249,13 +2877,13 @@ class TeilnahmesucheViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa16_nicht_erfuellter_status_wird_angezeigt(self):
+        """Eine erfolgreiche Suche zeigt auch einen noch nicht erfüllten Stundenstatus an."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Die Gesamtstunden auf 29,5 senken.
         self.untersuchung_alpha.stundenwert = 14.5
         self.untersuchung_alpha.save(update_fields=["stundenwert"])
 
-        # Der bewusst veränderte Bestand ist der neue Vergleichsstand.
+        # Die vorbereitete Änderung gehört zum neuen Vergleichsstand.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -3267,7 +2895,7 @@ class TeilnahmesucheViewTests(TestCase):
             },
         )
 
-        # Die Suche bleibt auch bei nicht erfüllten Mindestvorgaben erfolgreich.
+        # Ein nicht erfüllter Stundenstatus ist ein gültiges Suchergebnis.
         self.assertEqual(antwort.status_code, 200)
         ergebnis = antwort.json()
         self.assertTrue(ergebnis["erfolg"])
@@ -3283,6 +2911,7 @@ class TeilnahmesucheViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_qa04_lehrperson_kann_keine_teilnahmen_suchen(self):
+        """Eine Lehrperson erhält weder Teilnahmeangaben noch berechnete Stundensummen."""
         self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
 
         antwort = self.client.post(
@@ -3296,12 +2925,13 @@ class TeilnahmesucheViewTests(TestCase):
         ergebnis = antwort.json()
         self.assertFalse(ergebnis["erfolg"])
 
-        # Bei verweigertem Zugriff dürfen keine Ergebnisdaten enthalten sein.
+        # Eine verweigerte Anfrage darf auch keine Teil- oder Berechnungsergebnisse liefern.
         self.assertNotIn("teilnahmen", ergebnis)
         self.assertNotIn("berechnung", ergebnis)
         self.pruefe_unveraenderten_bestand()
 
     def test_qa04_suche_ohne_anmeldung_wird_abgewiesen(self):
+        """Eine nicht angemeldete Suche wird ohne Ergebnisdaten und Änderungen abgewiesen."""
         antwort = self.client.post(
             "/teilnahmen_suchen/",
             data={
@@ -3317,6 +2947,7 @@ class TeilnahmesucheViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa14_get_anfrage_wird_abgewiesen(self):
+        """Eine GET-Suche wird abgewiesen und weist POST als erlaubte Methode aus."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.get(
@@ -3332,9 +2963,10 @@ class TeilnahmesucheViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa14_fehlende_matrikelnummer_wird_abgewiesen(self):
+        """Eine fehlende Matrikelnummer wird vor dem Aufruf der Suchfunktion abgewiesen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Den in der View verwendeten Funktionsnamen vorübergehend ersetzen.
+        # Der Mock erfasst, ob die unvollständige Anfrage trotzdem eine Suche auslöst.
         with patch(
             "vp_stunden.views.suche_teilnahmen"
         ) as suchfunktion:
@@ -3346,11 +2978,11 @@ class TeilnahmesucheViewTests(TestCase):
         self.assertEqual(antwort.status_code, 400)
         self.assertFalse(antwort.json()["erfolg"])
 
-        # Die unvollständige Anfrage muss vor dem Suchaufruf abgewiesen werden.
         suchfunktion.assert_not_called()
         self.pruefe_unveraenderten_bestand()
 
     def test_fa14_fehlende_treffer_werden_gemeldet(self):
+        """Eine Suche ohne Treffer meldet den fehlenden Bestand ohne Teilnahmeangaben oder Summen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
         fehlende_matrikelnummer = "9999999"
 
@@ -3371,16 +3003,17 @@ class TeilnahmesucheViewTests(TestCase):
         ergebnis = antwort.json()
         self.assertFalse(ergebnis["erfolg"])
 
-        # Ohne Treffer werden weder Teilnahmeangaben noch Summen ausgegeben.
         self.assertNotIn("teilnahmen", ergebnis)
         self.assertNotIn("berechnung", ergebnis)
         self.pruefe_unveraenderten_bestand()
 
 
 class UntersuchungssucheViewTests(TestCase):
+    """Prüft Untersuchungsübersichten, Teilnamensuche und Zugriffsabweisungen."""
 
     def setUp(self):
-        # Untersuchungen entgegen der erwarteten A–Z-Reihenfolge anlegen.
+        """Legt drei synthetische Untersuchungen außerhalb der erwarteten Namensreihenfolge an."""
+        # Entgegen der Namensreihenfolge anlegen, damit eine fehlende Sortierung auffällt.
         self.beta = Untersuchung.objects.create(
             studienname="Beta-Studie",
             studienname_vergleich="beta-studie",
@@ -3404,6 +3037,7 @@ class UntersuchungssucheViewTests(TestCase):
         )
 
     def melde_testkonto_an(self, rolle):
+        """Legt ein synthetisches Rollenkonto an und richtet seine Sitzung per Anmeldung ein."""
         testpasswort = "a" * 64
         konto, fehlerliste = lege_konto_an(
             "testkonto",
@@ -3413,7 +3047,7 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die reguläre Anmeldung richtet die Sitzungsdaten ein.
+        # Die reguläre Anmeldung richtet zugleich die erforderlichen Sitzungsdaten ein.
         anmeldung = self.client.post(
             "/anmelden/",
             data={
@@ -3425,9 +3059,10 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertTrue(anmeldung.json()["erfolg"])
 
     def test_fa14_administrator_erhaelt_passende_sortierte_untersuchungen(self):
+        """Die Teilnamensuche ignoriert Großschreibung und liefert passende Untersuchungen sortiert."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Teilnamensuche und ignorierte Groß-/Kleinschreibung prüfen.
+        # Gemischte Großschreibung und ein Teilname prüfen denselben Suchbegriff.
         antwort = self.client.post(
             "/untersuchungen_suchen/",
             data={"suchtext": "sTuDiE"},
@@ -3438,7 +3073,7 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertTrue(ergebnis["erfolg"])
         self.assertEqual(len(ergebnis["untersuchungen"]), 2)
 
-        # Genau Alpha und Beta in dieser Reihenfolge erwarten.
+        # Antwortzeilen mit ihren erwarteten Untersuchungen und Positionen verbinden.
         for zeile, untersuchung in zip(
             ergebnis["untersuchungen"],
             [self.alpha, self.beta],
@@ -3449,13 +3084,14 @@ class UntersuchungssucheViewTests(TestCase):
             self.assertEqual(zeile["einordnung"], untersuchung.einordnung)
             self.assertEqual(zeile["lehrperson"], untersuchung.lehrperson)
 
-            # Den Antworttext für den Vergleich in einen Zeitpunkt umwandeln.
+            # Den JSON-Text für den Vergleich zurück in einen Zeitpunkt umwandeln.
             self.assertEqual(
                 datetime.fromisoformat(zeile["uploadzeitpunkt"]),
                 untersuchung.uploadzeitpunkt,
             )
 
     def test_qa04_suche_ohne_anmeldung_wird_abgewiesen(self):
+        """Eine nicht angemeldete Anfrage erhält keine Untersuchungsangaben."""
         antwort = self.client.post(
             "/untersuchungen_suchen/",
             data={"suchtext": "Studie"},
@@ -3467,6 +3103,7 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertNotIn("untersuchungen", ergebnis)
 
     def test_qa04_lehrperson_kann_keine_untersuchungen_suchen(self):
+        """Eine Lehrperson erhält keinen Zugriff auf die Untersuchungssuche."""
         self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
 
         antwort = self.client.post(
@@ -3480,6 +3117,7 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertNotIn("untersuchungen", ergebnis)
 
     def test_fa14_get_anfrage_wird_abgewiesen(self):
+        """Eine GET-Suche wird abgewiesen und weist POST als erlaubte Methode aus."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.get(
@@ -3492,9 +3130,10 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertFalse(antwort.json()["erfolg"])
 
     def test_fa14_fehlender_suchtext_wird_abgewiesen(self):
+        """Ein fehlender Suchparameter wird vor dem Suchaufruf abgewiesen."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Prüfen, dass die unvollständige Anfrage vor der Suche abbricht.
+        # Der Mock macht einen unzulässigen Suchaufruf bei fehlendem Parameter sichtbar.
         with patch(
             "vp_stunden.views.suche_untersuchungen"
         ) as suchfunktion:
@@ -3510,6 +3149,7 @@ class UntersuchungssucheViewTests(TestCase):
         suchfunktion.assert_not_called()
 
     def test_fa14_fehlende_treffer_werden_gemeldet(self):
+        """Eine erfolglose Suche meldet fehlende Treffer ohne Untersuchungsdaten."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         antwort = self.client.post(
@@ -3523,9 +3163,10 @@ class UntersuchungssucheViewTests(TestCase):
         self.assertNotIn("untersuchungen", ergebnis)
 
     def test_fa14_leerer_suchtext_liefert_alle_untersuchungen(self):
+        """Ein ausdrücklich leerer Suchtext liefert die vollständige, alphabetische Übersicht."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Ein ausdrücklich leerer Suchtext öffnet die Gesamtübersicht.
+        # Ein leerer Wert ist zulässig und unterscheidet sich vom fehlenden Parameter.
         antwort = self.client.post(
             "/untersuchungen_suchen/",
             data={"suchtext": ""},
@@ -3539,7 +3180,6 @@ class UntersuchungssucheViewTests(TestCase):
         for zeile in ergebnis["untersuchungen"]:
             gefundene_ids.append(zeile["untersuchung_id"])
 
-        # Vollständigkeit und feste A–Z-Reihenfolge gemeinsam prüfen.
         self.assertEqual(
             gefundene_ids,
             [self.alpha.pk, self.beta.pk, self.gamma.pk],
@@ -3547,9 +3187,10 @@ class UntersuchungssucheViewTests(TestCase):
 
 
 class UntersuchungskorrekturViewTests(TestCase):
+    """Prüft Korrekturanfragen, Eingabeprüfung und Rollenrechte."""
 
     def setUp(self):
-        # Vor jedem Test einen Ausgangsbestand an Untersuchungen anlegen.
+        """Legt eine Untersuchung, vollständige Korrekturdaten und den Vergleichsbestand an."""
         self.untersuchung = Untersuchung.objects.create(
             studienname="Ausgangsstudie",
             studienname_vergleich="ausgangsstudie",
@@ -3558,11 +3199,10 @@ class UntersuchungskorrekturViewTests(TestCase):
             lehrperson="Alte Lehrperson",
         )
 
-        # Die ID und den Upload-Zeitpunkt der Untersuchung speichern.
         self.untersuchung_id = self.untersuchung.pk
         self.uploadzeitpunkt = self.untersuchung.uploadzeitpunkt
 
-        # Alle Angaben senden, ausschließlich den Stundenwert ändern.
+        # Der vollständige Formularsatz ändert ausschließlich den Stundenwert.
         self.daten = {
             "untersuchung_id": str(self.untersuchung_id),
             "studienname": "Ausgangsstudie",
@@ -3571,12 +3211,13 @@ class UntersuchungskorrekturViewTests(TestCase):
             "lehrperson": "Alte Lehrperson",
         }
 
-        # Den gespeicherten Ausgangsbestand für Fehlerfälle festhalten.
+        # Alle gespeicherten Feldwerte als festen Vergleichsstand sichern.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
 
     def melde_testkonto_an(self, rolle):
+        """Legt ein synthetisches Rollenkonto an und richtet seine Sitzung per Anmeldung ein."""
         testpasswort = "a" * 64
         konto, fehlerliste = lege_konto_an(
             "testkonto",
@@ -3597,15 +3238,16 @@ class UntersuchungskorrekturViewTests(TestCase):
         self.assertTrue(anmeldung.json()["erfolg"])
 
     def pruefe_unveraenderten_bestand(self):
+        """Vergleicht sämtliche gespeicherten Feldwerte mit dem vorbereiteten Bestand."""
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
         )
 
     def test_fa15_einzelner_stundenwert_wird_korrigiert(self):
+        """Eine gültige Anfrage ändert ausschließlich den Stundenwert in Antwort und Datenbank."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Die Korrektur muss erfolgreich sein, da alle Angaben vollständig und korrekt sind.
         antwort = self.client.post(
             "/untersuchung_korrigieren/",
             data=self.daten,
@@ -3616,7 +3258,6 @@ class UntersuchungskorrekturViewTests(TestCase):
         self.assertTrue(ergebnis["erfolg"])
         zeile = ergebnis["untersuchung"]
 
-        # Die Antwort enthält den neuen Stundenwert und die übrigen Angaben.
         self.assertEqual(zeile["untersuchung_id"], self.untersuchung_id)
         self.assertEqual(zeile["studienname"], "Ausgangsstudie")
         self.assertEqual(zeile["stundenwert"], 2.5)
@@ -3627,7 +3268,7 @@ class UntersuchungskorrekturViewTests(TestCase):
             self.uploadzeitpunkt,
         )
 
-        # Den tatsächlichen Datenbankstand prüfen.
+        # Neu aus der Datenbank laden, damit die Antwort allein nicht als Speichernachweis gilt.
         self.untersuchung.refresh_from_db()
         self.assertEqual(self.untersuchung.pk, self.untersuchung_id)
         self.assertEqual(self.untersuchung.studienname, "Ausgangsstudie")
@@ -3647,6 +3288,7 @@ class UntersuchungskorrekturViewTests(TestCase):
         )
 
     def test_qa04_korrektur_ohne_anmeldung_wird_abgewiesen(self):
+        """Eine nicht angemeldete Korrektur wird ohne Datenänderung abgewiesen."""
         antwort = self.client.post(
             "/untersuchung_korrigieren/",
             data=self.daten,
@@ -3659,6 +3301,7 @@ class UntersuchungskorrekturViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_qa04_lehrperson_kann_keine_untersuchung_korrigieren(self):
+        """Eine Lehrperson darf keine gespeicherte Untersuchung korrigieren."""
         self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
 
         antwort = self.client.post(
@@ -3673,6 +3316,7 @@ class UntersuchungskorrekturViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa15_get_anfrage_wird_abgewiesen(self):
+        """Eine GET-Korrektur wird abgewiesen und weist POST als erlaubte Methode aus."""
         antwort = self.client.get(
             "/untersuchung_korrigieren/",
             data=self.daten,
@@ -3684,6 +3328,7 @@ class UntersuchungskorrekturViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa15_fehlende_parameter_werden_abgewiesen(self):
+        """Jeder fehlende Pflichtparameter wird vor der Korrekturfunktion gemeldet."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         for schluessel, feldname in [
@@ -3697,7 +3342,7 @@ class UntersuchungskorrekturViewTests(TestCase):
                 daten = self.daten.copy()
                 daten.pop(schluessel)
 
-                # Die Verarbeitung darf bei fehlenden Angaben nicht beginnen.
+                # Der Mock prüft, dass fehlende Angaben vor der eigentlichen Korrektur abgefangen werden.
                 with patch(
                     "vp_stunden.views.korrigiere_untersuchung"
                 ) as korrekturfunktion:
@@ -3718,6 +3363,7 @@ class UntersuchungskorrekturViewTests(TestCase):
                 self.pruefe_unveraenderten_bestand()
 
     def test_fa15_ungueltige_zahlen_werden_abgewiesen(self):
+        """Nicht lesbare Zahlenwerte werden vor der Korrekturfunktion feldbezogen gemeldet."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         for schluessel, feldname in [
@@ -3725,6 +3371,7 @@ class UntersuchungskorrekturViewTests(TestCase):
             ("stundenwert", "Stundenwert"),
         ]:
             with self.subTest(parameter=schluessel):
+                # Eine Kopie hält die Teilfälle voneinander unabhängig.
                 daten = self.daten.copy()
                 daten[schluessel] = "keine Zahl"
 
@@ -3748,9 +3395,10 @@ class UntersuchungskorrekturViewTests(TestCase):
                 self.pruefe_unveraenderten_bestand()
 
     def test_fa15_inhaltliche_fehler_werden_zurueckgegeben(self):
+        """Inhaltlich ungültige Angaben liefern Feldfehler und lassen den Bestand unverändert."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Diese Angaben erreichen die vorhandenen Feldprüfungen.
+        # Lesbare Zahlen und vorhandene Felder erreichen die nachgelagerten Inhaltsprüfungen.
         for schluessel, wert, feldname in [
             ("studienname", "", "Studienname"),
             ("stundenwert", "1.25", "Stundenwert"),
@@ -3777,12 +3425,14 @@ class UntersuchungskorrekturViewTests(TestCase):
 
 
 class ReporterzeugungViewTests(TestCase):
+    """Prüft PDF-Antworten, Reportvoraussetzungen und Fehlerbehandlung."""
 
     def setUp(self):
+        """Legt einen erfüllten Reportbestand mit abweichenden Namens- und Teilnahmefolgen an."""
         self.matrikelnummer = "1234567"
         self.daten = {"matrikelnummer": self.matrikelnummer}
 
-        # Untersuchungen zuerst in alphabetischer Reihenfolge anlegen.
+        # Namensreihenfolge und spätere Teilnahmereihenfolge bewusst gegeneinander setzen.
         self.untersuchung_alpha = Untersuchung.objects.create(
             studienname="Alpha-Studie",
             studienname_vergleich="alpha-studie",
@@ -3798,7 +3448,7 @@ class ReporterzeugungViewTests(TestCase):
             lehrperson="Testlehrperson Beta",
         )
 
-        # Die Teilnahmezuordnungen in der erwarteten Reportreihenfolge anlegen.
+        # Die Anlagereihenfolge der Teilnahmen bestimmt die erwartete Reihenfolge im Report.
         self.teilnahme_beta = Teilnahme.objects.create(
             untersuchung=self.untersuchung_beta,
             matrikelnummer=self.matrikelnummer,
@@ -3808,12 +3458,13 @@ class ReporterzeugungViewTests(TestCase):
             matrikelnummer=self.matrikelnummer,
         )
 
-        # Diese fremde Teilnahme darf im Report nicht berücksichtigt werden.
+        # Die fremde Teilnahme darf weder Reportinhalt noch Stundensummen beeinflussen.
         Teilnahme.objects.create(
             untersuchung=self.untersuchung_alpha,
             matrikelnummer="7654321",
         )
 
+        # Alle Feldwerte festhalten, da die Reporterzeugung keine Daten ändern darf.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -3822,6 +3473,7 @@ class ReporterzeugungViewTests(TestCase):
         )
 
     def melde_testkonto_an(self, rolle):
+        """Legt ein synthetisches Rollenkonto an und richtet seine Sitzung per Anmeldung ein."""
         testpasswort = "a" * 64
         konto, fehlerliste = lege_konto_an(
             "testkonto",
@@ -3831,7 +3483,7 @@ class ReporterzeugungViewTests(TestCase):
         self.assertIsNotNone(konto)
         self.assertFalse(fehlerliste)
 
-        # Die reguläre Anmeldung richtet die erforderlichen Sitzungsdaten ein.
+        # Die reguläre Anmeldung richtet zugleich die erforderlichen Sitzungsdaten ein.
         anmeldung = self.client.post(
             "/anmelden/",
             data={
@@ -3843,6 +3495,7 @@ class ReporterzeugungViewTests(TestCase):
         self.assertTrue(anmeldung.json()["erfolg"])
 
     def pruefe_unveraenderten_bestand(self):
+        """Vergleicht sämtliche gespeicherten Feldwerte mit dem vorbereiteten Bestand."""
         self.assertEqual(
             list(Untersuchung.objects.order_by("pk").values()),
             self.untersuchungsbestand,
@@ -3853,7 +3506,8 @@ class ReporterzeugungViewTests(TestCase):
         )
 
     def pruefe_abweisung(self, daten, status):
-        # Bei einer abgewiesenen Anfrage darf keine PDF-Erzeugung stattfinden.
+        """Prüft HTTP-Abweisung, ausgebliebene PDF-Erzeugung und unveränderte Daten."""
+        # Der Mock prüft zusätzlich zum HTTP-Status, dass keine PDF-Erzeugung beginnt.
         with patch(
             "vp_stunden.views.erzeuge_report"
         ) as reportfunktion:
@@ -3868,9 +3522,10 @@ class ReporterzeugungViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa17_administrator_erhaelt_pdf_in_importreihenfolge(self):
+        """Die Reportanfrage liefert PDF-Daten und übergibt passende Teilnahmen in Importreihenfolge."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # wraps führt die echte Funktion aus und hält ihre Aufrufargumente fest.
+        # wraps führt die echte Reporterzeugung aus und zeichnet ihre Aufrufargumente auf.
         with patch(
             "vp_stunden.views.erzeuge_report",
             wraps=erzeuge_report,
@@ -3890,7 +3545,7 @@ class ReporterzeugungViewTests(TestCase):
             'attachment; filename="vp_stunden_1234567.pdf"',
         )
 
-        # Anfangs- und Endmarkierung der erzeugten PDF-Daten prüfen.
+        # PDF-Markierungen prüfen das Ausgabeformat, nicht den vollständigen Dokumentinhalt.
         self.assertTrue(antwort.content.startswith(b"%PDF-"))
         self.assertTrue(antwort.content.rstrip().endswith(b"%%EOF"))
 
@@ -3901,7 +3556,7 @@ class ReporterzeugungViewTests(TestCase):
 
         self.assertEqual(matrikelnummer, self.matrikelnummer)
 
-        # Genau die passenden Teilnahmen in ihrer Anlagereihenfolge erwarten.
+        # Die übergebenen IDs prüfen Auswahl und Importreihenfolge unabhängig von den Namen.
         teilnahme_ids = [teilnahme.pk for teilnahme in teilnahmen]
         self.assertEqual(
             teilnahme_ids,
@@ -3920,13 +3575,16 @@ class ReporterzeugungViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_qa04_report_ohne_anmeldung_wird_abgewiesen(self):
+        """Eine nicht angemeldete Reportanfrage wird ohne PDF-Erzeugung abgewiesen."""
         self.pruefe_abweisung(self.daten, 403)
 
     def test_qa04_lehrperson_kann_keinen_report_erzeugen(self):
+        """Eine Lehrperson darf keinen Report erzeugen."""
         self.melde_testkonto_an(Benutzerkonto.LEHRPERSON)
         self.pruefe_abweisung(self.daten, 403)
 
     def test_fa17_get_anfrage_wird_abgewiesen(self):
+        """Eine GET-Reportanfrage wird ohne PDF-Erzeugung abgewiesen."""
         with patch(
             "vp_stunden.views.erzeuge_report"
         ) as reportfunktion:
@@ -3942,14 +3600,15 @@ class ReporterzeugungViewTests(TestCase):
         self.pruefe_unveraenderten_bestand()
 
     def test_fa17_fehlende_matrikelnummer_wird_abgewiesen(self):
+        """Eine fehlende oder leere Matrikelnummer verhindert die Reportverarbeitung."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Einen fehlenden Schlüssel und einen ausdrücklich leeren Wert prüfen.
         for daten in [{}, {"matrikelnummer": ""}]:
             with self.subTest(daten=daten):
                 self.pruefe_abweisung(daten, 400)
 
     def test_fa17_fehlende_teilnahmen_werden_gemeldet(self):
+        """Eine Matrikelnummer ohne Teilnahmen erhält keinen Report."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
         self.pruefe_abweisung(
@@ -3958,10 +3617,10 @@ class ReporterzeugungViewTests(TestCase):
         )
 
     def test_fa17_nicht_erfuellter_status_verhindert_report(self):
+        """Zu wenige Gesamt- oder Präsenzstunden verhindern jeweils die Reporterzeugung."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
 
-        # Fall 1: 29,5 Gesamtstunden bei 15 Präsenzstunden.
-        # Fall 2: 30 Gesamtstunden bei nur 14,5 Präsenzstunden.
+        # Jeder Teilfall unterschreitet genau eine der beiden Mindestgrenzen.
         for online, praesenz in [(14.5, 15.0), (15.5, 14.5)]:
             with self.subTest(online=online, praesenz=praesenz):
                 self.untersuchung_alpha.stundenwert = online
@@ -3973,7 +3632,7 @@ class ReporterzeugungViewTests(TestCase):
                     update_fields=["stundenwert"]
                 )
 
-                # Die bewusst geänderten Werte sind der neue Vergleichsstand.
+                # Die vorbereiteten Änderungen gehören zum neuen Vergleichsstand.
                 self.untersuchungsbestand = list(
                     Untersuchung.objects.order_by("pk").values()
                 )
@@ -3981,10 +3640,11 @@ class ReporterzeugungViewTests(TestCase):
                 self.pruefe_abweisung(self.daten, 400)
 
     def test_fa17_erzeugungsfehler_wird_kontrolliert_beantwortet(self):
+        """Ein Erzeugungsfehler wird ohne interne Fehlerdetails und Datenänderungen beantwortet."""
         self.melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
         interner_fehler = "INTERNER_TESTFEHLER"
 
-        # Einen technischen Fehler ausschließlich für diesen Aufruf auslösen.
+        # Den Erzeugungsfehler gezielt auslösen und seine internen Details im Antworttext ausschließen.
         with patch(
             "vp_stunden.views.erzeuge_report",
             side_effect=RuntimeError(interner_fehler),
@@ -4008,8 +3668,7 @@ class UebergangsimportZuordnungTests(TestCase):
     """Prüft Zuordnung, Datenübernahme und vollständige Abweisung."""
 
     def setUp(self):
-        # Django ruft setUp vor jeder Testmethode neu auf.
-        # Alle Daten entstehen ausschließlich in der gesonderten Testdatenbank.
+        """Bereitet Altbestand und eine gültige Übergangsdatei für jeden Test neu vor."""
         self.untersuchung = Untersuchung.objects.create(
             studienname="Bestandsstudie",
             studienname_vergleich="bestandsstudie",
@@ -4022,9 +3681,8 @@ class UebergangsimportZuordnungTests(TestCase):
             matrikelnummer="7654321",
         )
 
-        # values() erfasst sämtliche gespeicherten Felder einschließlich IDs
-        # und Uploadzeitpunkt. list() hält den jetzigen Stand sofort fest.
-        # Dadurch reichen später gleich gebliebene Anzahlen allein nicht aus.
+        # list(values()) hält alle Feldwerte sofort fest, auch IDs und Zeitpunkt.
+        # Spätere Vergleiche erkennen damit Änderungen trotz gleicher Datensatzanzahl.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -4032,7 +3690,7 @@ class UebergangsimportZuordnungTests(TestCase):
             Teilnahme.objects.order_by("pk").values()
         )
 
-        # Die Testdatei wird in der Testdatenbank erzeugt, nicht auf der Festplatte.
+        # Die XLSX-Datei entsteht im Speicher. addCleanup schließt die Arbeitsmappe.
         self.arbeitsmappe = Workbook()
         self.addCleanup(self.arbeitsmappe.close)
         self.blatt = self.arbeitsmappe.active
@@ -4045,8 +3703,8 @@ class UebergangsimportZuordnungTests(TestCase):
             "Verantwortliche Lehrperson",
         ])
 
-        # Zeile 2 ergänzt die vorhandene Untersuchung. Andere Großschreibung
-        # und äußere Leerzeichen dürfen die Zuordnung nicht verhindern.
+        # Abweichende Schreibweise und äußere Leerzeichen dürfen die Zuordnung
+        # zur vorhandenen Untersuchung in Zeile 2 nicht verhindern.
         self.blatt.append([
             1234567,
             "  BESTANDSSTUDIE  ",
@@ -4066,8 +3724,8 @@ class UebergangsimportZuordnungTests(TestCase):
         ])
 
     def test_fa11_neue_und_vorhandene_untersuchung_werden_importiert(self):
-        # BytesIO ersetzt eine Datei auf der Festplatte.
-        # SimpleUploadedFile stellt die erzeugten XLSX-Bytes als Upload bereit.
+        """Ordnet vorhandene Untersuchungen zu und speichert neue Untersuchungen mit Teilnahmen."""
+        # BytesIO sammelt XLSX-Bytes im Speicher, SimpleUploadedFile bildet den Upload nach.
         with BytesIO() as puffer:
             self.arbeitsmappe.save(puffer)
             datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
@@ -4093,8 +3751,7 @@ class UebergangsimportZuordnungTests(TestCase):
         self.assertGreaterEqual(neue_untersuchung.uploadzeitpunkt, beginn)
         self.assertLessEqual(neue_untersuchung.uploadzeitpunkt, ende)
 
-        # Außer der einen neuen Untersuchung muss der vollständige alte
-        # Untersuchungsbestand erhalten sein, auch Schreibweise und Zeitpunkt.
+        # Der Altbestand muss einschließlich Schreibweise und Zeitpunkt unverändert bleiben.
         self.assertEqual(
             list(
                 Untersuchung.objects.exclude(
@@ -4104,8 +3761,7 @@ class UebergangsimportZuordnungTests(TestCase):
             self.untersuchungsbestand,
         )
 
-        # Beide neuen Teilnahmen gehören zur importierten Matrikelnummer.
-        # Die IDs zeigen zugleich die Zuordnung und die Anlage in Zeilenfolge.
+        # Die Untersuchungs-IDs prüfen Zuordnung und Anlage in der Reihenfolge der Zeilen.
         self.assertEqual(
             list(
                 Teilnahme.objects.filter(
@@ -4124,6 +3780,7 @@ class UebergangsimportZuordnungTests(TestCase):
         )
 
     def test_fa11_unterschiedliche_matrikelnummern_werden_abgewiesen(self):
+        """Weist verschiedene Matrikelnummern ohne Änderung am Bestand ab."""
         self.blatt["A4"] = 2345678
 
         with BytesIO() as puffer:
@@ -4132,8 +3789,7 @@ class UebergangsimportZuordnungTests(TestCase):
 
         fehlerliste = importiere_uebergangsdatei(datei)
 
-        # Die Zellfundstelle prüfen, ohne den gesamten Meldungstext festzulegen.
-        # any() verlangt mindestens eine passende Meldung.
+        # Die Fundstelle muss vorkommen, der übrige Meldungstext bleibt frei.
         self.assertTrue(
             any(meldung.startswith("A4:") for meldung in fehlerliste),
             fehlerliste,
@@ -4148,8 +3804,8 @@ class UebergangsimportZuordnungTests(TestCase):
         )
 
     def test_fa12_doppelte_untersuchung_in_datei_wird_abgewiesen(self):
-        # Zeile 5 wiederholt die neue Untersuchung mit anderer Schreibweise.
-        # Auch die gültige Ergänzung aus Zeile 2 darf dann nicht gespeichert werden.
+        """Weist doppelte Studiennamen trotz anderer Schreibweise ohne Teilimport ab."""
+        # Auch mit anderer Schreibweise ist Zeile 5 eine Dublette von Zeile 4.
         self.blatt.append([
             1234567,
             "  NEUE STUDIE  ",
@@ -4178,6 +3834,7 @@ class UebergangsimportZuordnungTests(TestCase):
         )
 
     def test_fa12_bereits_gespeicherte_teilnahme_wird_abgewiesen(self):
+        """Weist eine bereits gespeicherte Teilnahme ab und erhält den gesamten Bestand."""
         Teilnahme.objects.create(
             untersuchung=self.untersuchung,
             matrikelnummer="1234567",
@@ -4208,8 +3865,9 @@ class UebergangsimportZuordnungTests(TestCase):
         )
 
     def test_fa12_abweichende_bestandsangaben_werden_abgewiesen(self):
-        # Jeder Wert ist für sich zulässig, widerspricht aber dem Bestand.
-        # Einzeln prüfen, damit kein anderer Fehler eine fehlende Prüfung verdeckt.
+        """Weist jede Abweichung von gemeinsamen Bestandsangaben ohne Datenänderung ab."""
+        # Jeden sonst gültigen Wert einzeln verändern, damit kein anderer Fehler
+        # eine fehlende Prüfung des Bestandsvergleichs verdeckt.
         for adresse, abweichender_wert in [
             ("C2", 2.0),
             ("D2", Untersuchung.ONLINE),
@@ -4219,15 +3877,14 @@ class UebergangsimportZuordnungTests(TestCase):
                 urspruenglicher_wert = self.blatt[adresse].value
                 self.blatt[adresse] = abweichender_wert
 
-                # Jeder Teilfall braucht einen neuen Upload, weil die
-                # Importfunktion den vorherigen Upload bereits geschlossen hat.
+                # Der vorherige Upload ist geschlossen, jeder Teilfall braucht einen neuen.
                 with BytesIO() as puffer:
                     self.arbeitsmappe.save(puffer)
                     datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
 
                 fehlerliste = importiere_uebergangsdatei(datei)
 
-                # Das gemeinsame Workbook für den nächsten Teilfall zurücksetzen.
+                # subTest setzt Änderungen nicht zurück: den Ausgangswert selbst wiederherstellen.
                 self.blatt[adresse] = urspruenglicher_wert
 
                 self.assertTrue(
@@ -4247,9 +3904,9 @@ class UebergangsimportZuordnungTests(TestCase):
                 )
 
     def test_fa11_zellfehler_werden_gesammelt_und_datei_abgewiesen(self):
-        # Zeile 4 ist teilweise gefüllt und muss vollständig geprüft werden.
-        # Der ungültige Stundenwert darf die Prüfung der fehlenden Lehrperson
-        # nicht verhindern. Auch Zeile 2 darf nicht übernommen werden.
+        """Meldet mehrere Zellfehler gemeinsam und speichert auch gültige Zeilen nicht."""
+        # Zwei unabhängige Fehler in Zeile 4 dürfen sich nicht gegenseitig verdecken.
+        # Auch die gültige Zeile 2 darf bei der Abweisung nicht gespeichert werden.
         self.blatt["C4"] = 0.25
         self.blatt["E4"] = None
 
@@ -4274,15 +3931,14 @@ class UebergangsimportZuordnungTests(TestCase):
         )
 
     def test_fa11_speicherfehler_nimmt_alle_aenderungen_zurueck(self):
+        """Nimmt bei einem Speicherfehler neue Untersuchungen und Teilnahmen vollständig zurück."""
         with BytesIO() as puffer:
             self.arbeitsmappe.save(puffer)
             datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
 
-        # wraps hält die echte Speichermethode fest. DEFAULT lässt den ersten
-        # Aufruf normal speichern: die Ergänzung zur vorhandenen Untersuchung.
-        # Beim zweiten Teilnahmeaufruf ist auch die neue Untersuchung angelegt.
-        # Erst dann löst der Test einen Fehler aus. So wird eine tatsächliche
-        # Rücknahme beider Änderungsarten geprüft.
+        # wraps verwendet die echte Speichermethode, DEFAULT lässt den ersten Aufruf durch.
+        # Der zweite scheitert nach Anlage der neuen Untersuchung. Die Transaktion muss
+        # diese Untersuchung und die zuvor gespeicherte Teilnahme zurücknehmen.
         with patch(
             "vp_stunden.importe.Teilnahme.objects.create",
             wraps=Teilnahme.objects.create,
@@ -4309,8 +3965,8 @@ class RegulaererImportTests(TestCase):
     """Prüft Datenübernahme und vollständige Abweisung beim regulären Import."""
 
     def setUp(self):
-        # Jeder Test beginnt mit demselben synthetischen Altbestand.
-        # Untersuchung und Teilnahme liegen in der gesonderten Testdatenbank.
+        """Bereitet Altbestand und eine gültige reguläre Importdatei für jeden Test neu vor."""
+        # Der synthetische Altbestand entsteht vor jedem Test in der Testdatenbank neu.
         self.untersuchung = Untersuchung.objects.create(
             studienname="Bestandsstudie",
             studienname_vergleich="bestandsstudie",
@@ -4323,8 +3979,7 @@ class RegulaererImportTests(TestCase):
             matrikelnummer="9876543",
         )
 
-        # Vollständige Feldwerte sofort festhalten. So werden später auch
-        # unbeabsichtigte Änderungen erkannt, bei denen die Anzahl gleich bleibt.
+        # Alle Feldwerte sofort festhalten, um auch Änderungen bei gleicher Anzahl zu erkennen.
         self.untersuchungsbestand = list(
             Untersuchung.objects.order_by("pk").values()
         )
@@ -4332,8 +3987,7 @@ class RegulaererImportTests(TestCase):
             Teilnahme.objects.order_by("pk").values()
         )
 
-        # Die Arbeitsmappe entsteht im Arbeitsspeicher.
-        # addCleanup sorgt nach dem Test für das Schließen der Arbeitsmappe.
+        # Die XLSX-Datei entsteht im Speicher. addCleanup schließt die Arbeitsmappe.
         self.arbeitsmappe = Workbook()
         self.addCleanup(self.arbeitsmappe.close)
         self.blatt = self.arbeitsmappe.active
@@ -4350,14 +4004,14 @@ class RegulaererImportTests(TestCase):
         self.blatt["B3"] = Untersuchung.ONLINE
         self.blatt["B4"] = "  Testlehrperson Neu  "
 
-        # Zahlen in Excel eintragen. Erst der Import wandelt sie für
-        # die Speicherung in Zeichenfolgen um. Die Lücke darf ihn nicht stoppen.
+        # Numerische Excel-Werte müssen als Zeichenfolgen gespeichert werden.
+        # A106 prüft zugleich, dass die große Lücke den Import nicht beendet.
         self.blatt["A7"] = 1234567
         self.blatt["A106"] = 7654321
 
     def test_fa10_untersuchung_und_teilnahmen_werden_gespeichert(self):
-        # Die Arbeitsmappe als XLSX-Bytes schreiben und als Speicherupload
-        # bereitstellen. Es wird keine Datei auf der Festplatte angelegt.
+        """Speichert eine neue Untersuchung mit allen Teilnahmen und erhält den Altbestand."""
+        # BytesIO sammelt XLSX-Bytes im Speicher, SimpleUploadedFile bildet den Upload nach.
         with BytesIO() as puffer:
             self.arbeitsmappe.save(puffer)
             datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
@@ -4383,8 +4037,7 @@ class RegulaererImportTests(TestCase):
         self.assertGreaterEqual(neue_untersuchung.uploadzeitpunkt, beginn)
         self.assertLessEqual(neue_untersuchung.uploadzeitpunkt, ende)
 
-        # Außer der neuen Untersuchung muss der alte Bestand vollständig
-        # unverändert bleiben, einschließlich seines Uploadzeitpunkts.
+        # Die neue Untersuchung herausnehmen und sämtliche alten Feldwerte vergleichen.
         self.assertEqual(
             list(
                 Untersuchung.objects.exclude(
@@ -4394,8 +4047,7 @@ class RegulaererImportTests(TestCase):
             self.untersuchungsbestand,
         )
 
-        # Genau die beiden Nummern müssen derselben neuen Untersuchung
-        # zugeordnet sein. A106 muss trotz der vorherigen Lücke übernommen werden.
+        # Beide Nummern müssen derselben Untersuchung zugeordnet sein, auch die aus A106.
         self.assertEqual(
             list(
                 Teilnahme.objects.filter(
@@ -4414,6 +4066,7 @@ class RegulaererImportTests(TestCase):
         )
 
     def test_fa08_doppelte_matrikelnummer_wird_abgewiesen(self):
+        """Weist eine wiederholte Matrikelnummer ohne Datenübernahme ab."""
         self.blatt["A106"] = 1234567
 
         with BytesIO() as puffer:
@@ -4437,8 +4090,8 @@ class RegulaererImportTests(TestCase):
         )
 
     def test_fa08_bereits_gespeicherte_untersuchung_wird_abgewiesen(self):
-        # Äußere Leerzeichen und andere Großschreibung dürfen den
-        # Bestandskonflikt nicht verdecken. Regulär wird nichts ergänzt.
+        """Erkennt vorhandene Studiennamen trotz anderer Schreibweise und weist den Import ab."""
+        # Andere Großschreibung und äußere Leerzeichen dürfen den Bestandskonflikt nicht verdecken.
         self.blatt["B1"] = "  BESTANDSSTUDIE  "
 
         with BytesIO() as puffer:
@@ -4461,9 +4114,9 @@ class RegulaererImportTests(TestCase):
         )
 
     def test_fa09_unabhaengige_zellfehler_werden_gesammelt(self):
-        # Die einzelnen Feldprüfungen haben bereits eigene Tests.
-        # Hier wird geprüft, ob der Import sie einbindet und ihre Fehler
-        # unabhängig sammelt, auch wenn schon der Studienname ungültig ist.
+        """Sammelt Fehler aller Eingabefelder und erhält den vollständigen Bestand."""
+        # Die Feldprüfungen sind separat getestet. Hier muss der Import alle Fehler
+        # sammeln, auch wenn bereits der Studienname ungültig ist.
         self.blatt["B1"] = "   "
         self.blatt["B2"] = 0.25
         self.blatt["B3"] = "p"
@@ -4493,6 +4146,7 @@ class RegulaererImportTests(TestCase):
         )
 
     def test_fa06_ohne_matrikelnummer_wird_datei_abgewiesen(self):
+        """Weist eine Datei ohne Teilnahmen ab und erhält den Bestand."""
         self.blatt["A7"] = None
         self.blatt["A106"] = None
 
@@ -4516,14 +4170,13 @@ class RegulaererImportTests(TestCase):
         )
 
     def test_fa09_speicherfehler_nimmt_alle_aenderungen_zurueck(self):
+        """Nimmt Untersuchung und erste Teilnahme nach einem späteren Speicherfehler zurück."""
         with BytesIO() as puffer:
             self.arbeitsmappe.save(puffer)
             datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
 
-        # wraps hält die echte Speichermethode fest. DEFAULT lässt den ersten
-        # Teilnahmeaufruf tatsächlich speichern. Erst der zweite scheitert.
-        # Dann müssen sowohl die Untersuchung als auch die erste Teilnahme
-        # durch die gemeinsame Transaktion zurückgenommen werden.
+        # wraps verwendet die echte Speichermethode, DEFAULT lässt den ersten Aufruf durch.
+        # Der zweite scheitert. Die Transaktion muss Untersuchung und erste Teilnahme zurücknehmen.
         with patch(
             "vp_stunden.importe.Teilnahme.objects.create",
             wraps=Teilnahme.objects.create,
@@ -4544,3 +4197,2233 @@ class RegulaererImportTests(TestCase):
             list(Teilnahme.objects.order_by("pk").values()),
             self.teilnahmebestand,
         )
+
+
+class ImportVorlagenstrukturTests(TestCase):
+    """Prüft Vorlagenaufbau und Teilnahmezeilengrenzen nach FA-06/FA-11."""
+
+    def setUp(self):
+        """Bereitet Altbestand und beide gültigen Vorlagen für jeden Test neu vor."""
+        # Der Altbestand macht unbeabsichtigte Änderungen bei einer Abweisung sichtbar.
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+        # Vollständige Feldwerte vergleichen, damit unveränderte Anzahlen allein nicht genügen.
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        # Gültige Vorlagen mit je einem Eintrag bilden die Grundlage der gezielten Änderungen.
+        # Arbeitsmappen und XLSX-Uploads bleiben im Speicher, addCleanup schließt die Mappen.
+        self.regulaere_mappe = Workbook()
+        self.addCleanup(self.regulaere_mappe.close)
+        self.regulaeres_blatt = self.regulaere_mappe.active
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Neue reguläre Studie",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            self.regulaeres_blatt[adresse] = wert
+
+        self.uebergangsmappe = Workbook()
+        self.addCleanup(self.uebergangsmappe.close)
+        self.uebergangsblatt = self.uebergangsmappe.active
+        self.uebergangsblatt.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        self.uebergangsblatt.append([
+            1234567,
+            "Übergangsstudie 1",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+
+    def test_fa06_regulaere_beschriftungen_muessen_exakt_stimmen(self):
+        """Weist jede fehlende oder abweichende reguläre Beschriftung ohne Datenänderung ab."""
+        for adresse in ["A1", "A2", "A3", "A4", "A6"]:
+            original = self.regulaeres_blatt[adresse].value
+
+            # Auch ein zusätzliches Leerzeichen verletzt die exakte Beschriftung.
+            for falsch in [None, original + " "]:
+                with self.subTest(zelle=adresse, inhalt=falsch):
+                    self.regulaeres_blatt[adresse] = falsch
+                    with BytesIO() as puffer:
+                        self.regulaere_mappe.save(puffer)
+                        datei = SimpleUploadedFile("regulaer.xlsx", puffer.getvalue())
+
+                    fehlerliste = importiere_untersuchung(datei)
+
+                    # subTest setzt nichts zurück: den Ausgangswert vor den Assertions wiederherstellen.
+                    self.regulaeres_blatt[adresse] = original
+                    self.assertTrue(
+                        any(m.startswith(f"{adresse}:") for m in fehlerliste),
+                        fehlerliste,
+                    )
+                    self.assertEqual(
+                        list(Untersuchung.objects.order_by("pk").values()),
+                        self.untersuchungsbestand,
+                    )
+                    self.assertEqual(
+                        list(Teilnahme.objects.order_by("pk").values()),
+                        self.teilnahmebestand,
+                    )
+
+    def test_fa11_uebergangsbeschriftungen_muessen_exakt_stimmen(self):
+        """Weist jede fehlende oder abweichende Übergangsbeschriftung ohne Datenänderung ab."""
+        for adresse in ["A1", "B1", "C1", "D1", "E1"]:
+            original = self.uebergangsblatt[adresse].value
+
+            for falsch in [None, original + " "]:
+                with self.subTest(zelle=adresse, inhalt=falsch):
+                    self.uebergangsblatt[adresse] = falsch
+                    with BytesIO() as puffer:
+                        self.uebergangsmappe.save(puffer)
+                        datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+                    fehlerliste = importiere_uebergangsdatei(datei)
+
+                    # Den Ausgangswert vor den Assertions für den nächsten Teilfall wiederherstellen.
+                    self.uebergangsblatt[adresse] = original
+                    self.assertTrue(
+                        any(m.startswith(f"{adresse}:") for m in fehlerliste),
+                        fehlerliste,
+                    )
+                    self.assertEqual(
+                        list(Untersuchung.objects.order_by("pk").values()),
+                        self.untersuchungsbestand,
+                    )
+                    self.assertEqual(
+                        list(Teilnahme.objects.order_by("pk").values()),
+                        self.teilnahmebestand,
+                    )
+
+    def test_fa06_regulaer_unzulaessige_zellinhalte_werden_abgewiesen(self):
+        """Weist zusätzliche Inhalte und scheinbar leere Matrikelnummernzellen vollständig ab."""
+        # Auch Leerzeichen, 0 und False sind außerhalb der Eingabezellen unzulässiger Inhalt.
+        # Innerhalb des Bereichs ist eine Zelle mit Leerzeichen ebenfalls nicht leer.
+        for adresse, wert in [
+            ("A5", "Zusatz"),
+            ("B6", "Zusatz"),
+            ("B7", "Zusatz"),
+            ("C1", "Zusatz"),
+            ("C1", "   "),
+            ("C1", 0),
+            ("C1", False),
+            ("A8", "   "),
+        ]:
+            with self.subTest(zelle=adresse, inhalt=wert):
+                self.regulaeres_blatt[adresse] = wert
+                with BytesIO() as puffer:
+                    self.regulaere_mappe.save(puffer)
+                    datei = SimpleUploadedFile("regulaer.xlsx", puffer.getvalue())
+
+                fehlerliste = importiere_untersuchung(datei)
+
+                # Den leeren Ausgangszustand für den nächsten Teilfall wiederherstellen.
+                self.regulaeres_blatt[adresse] = None
+                self.assertTrue(
+                    any(m.startswith(f"{adresse}:") for m in fehlerliste),
+                    fehlerliste,
+                )
+                self.assertEqual(
+                    list(Untersuchung.objects.order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_fa11_uebergang_unzulaessige_zellinhalte_werden_abgewiesen(self):
+        """Weist zusätzliche Inhalte und unvollständige Übergangszeilen vollständig ab."""
+        # Spalte F liegt außerhalb der Vorlage. Leerzeichen in B101 erzeugen dagegen
+        # eine unvollständige Eingabezeile, die auch hinter der Lücke geprüft werden muss.
+        for adresse, wert in [
+            ("F1", "Zusatz"),
+            ("F2", "Zusatz"),
+            ("F2", "   "),
+            ("F2", 0),
+            ("F2", False),
+            ("B101", "   "),
+        ]:
+            with self.subTest(zelle=adresse, inhalt=wert):
+                self.uebergangsblatt[adresse] = wert
+                with BytesIO() as puffer:
+                    self.uebergangsmappe.save(puffer)
+                    datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+                fehlerliste = importiere_uebergangsdatei(datei)
+
+                # Den leeren Ausgangszustand für den nächsten Teilfall wiederherstellen.
+                self.uebergangsblatt[adresse] = None
+                self.assertTrue(
+                    any(m.startswith(f"{adresse}:") for m in fehlerliste),
+                    fehlerliste,
+                )
+                self.assertEqual(
+                    list(Untersuchung.objects.order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_fa06_regulaer_genau_100_matrikelnummern_sind_zulaessig(self):
+        """Übernimmt genau 100 Nummern trotz freiem Blattnamen und formatierter Leerzellen."""
+        # Freier Blattname und reine Formatierung außerhalb des Eingabebereichs sind zulässig.
+        self.regulaeres_blatt.title = "Anderer Blattname"
+        for adresse in ["A107", "B7", "Z200"]:
+            self.regulaeres_blatt[adresse].number_format = "0.00"
+
+        # Genau die zulässigen Zeilen A7 bis A106 mit unterschiedlichen Nummern füllen.
+        for nummer in range(100):
+            self.regulaeres_blatt.cell(
+                row=nummer + 7, column=1, value=1_000_000 + nummer
+            )
+
+        with BytesIO() as puffer:
+            self.regulaere_mappe.save(puffer)
+            datei = SimpleUploadedFile("regulaer.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        self.assertEqual(fehlerliste, [])
+        neue_untersuchung = Untersuchung.objects.get(
+            studienname_vergleich="neue reguläre studie"
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    untersuchung=neue_untersuchung
+                ).order_by("pk").values_list("matrikelnummer", flat=True)
+            ),
+            [str(1_000_000 + nummer) for nummer in range(100)],
+        )
+        self.assertEqual(
+            list(
+                Untersuchung.objects.exclude(
+                    pk=neue_untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    untersuchung=neue_untersuchung
+                ).order_by("pk").values()
+            ),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_uebergang_genau_100_teilnahmezeilen_sind_zulaessig(self):
+        """Übernimmt genau 100 Übergangszeilen trotz freiem Blattnamen und formatierter Leerzellen."""
+        # Auch hier dürfen freier Blattname und reine Formatierung den Import nicht verhindern.
+        self.uebergangsblatt.title = "Anderer Blattname"
+        for adresse in ["A102", "F2", "Z200"]:
+            self.uebergangsblatt[adresse].number_format = "0.00"
+
+        # Zeilen 2 bis 101: unterschiedliche Untersuchungen für dieselbe Matrikelnummer.
+        for nummer in range(1, 101):
+            zeile = nummer + 1
+            self.uebergangsblatt.cell(zeile, 1, 1234567)
+            self.uebergangsblatt.cell(zeile, 2, f"Übergangsstudie {nummer}")
+            self.uebergangsblatt.cell(zeile, 3, 0.5)
+            self.uebergangsblatt.cell(zeile, 4, Untersuchung.PRAESENZ)
+            self.uebergangsblatt.cell(zeile, 5, "Testlehrperson Neu")
+
+        with BytesIO() as puffer:
+            self.uebergangsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertEqual(fehlerliste, [])
+        self.assertEqual(Untersuchung.objects.count(), 101)
+
+        # untersuchung__studienname folgt der Beziehung und prüft jede einzelne Zuordnung.
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values_list("untersuchung__studienname", flat=True)
+            ),
+            [f"Übergangsstudie {nummer}" for nummer in range(1, 101)],
+        )
+        self.assertEqual(
+            list(
+                Untersuchung.objects.filter(
+                    pk=self.untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values()
+            ),
+            self.teilnahmebestand,
+        )
+
+    def test_fa06_regulaer_101_matrikelnummern_werden_abgewiesen(self):
+        """Weist die 101. Matrikelnummer ab und speichert keine der gültigen Nummern."""
+        # Alle Nummern sind gültig und verschieden, nur A107 liegt außerhalb des Bereichs.
+        for nummer in range(101):
+            self.regulaeres_blatt.cell(
+                row=nummer + 7, column=1, value=1_000_000 + nummer
+            )
+
+        with BytesIO() as puffer:
+            self.regulaere_mappe.save(puffer)
+            datei = SimpleUploadedFile("regulaer.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_untersuchung(datei)
+
+        self.assertTrue(
+            any(m.startswith("A107:") for m in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_uebergang_101_teilnahmezeilen_werden_abgewiesen(self):
+        """Weist die 101. Teilnahmezeile ab und speichert keine der gültigen Zeilen."""
+        # Alle 101 Teilnahmen sind sonst gültig, nur Zeile 102 überschreitet den Bereich.
+        for nummer in range(1, 102):
+            zeile = nummer + 1
+            self.uebergangsblatt.cell(zeile, 1, 1234567)
+            self.uebergangsblatt.cell(zeile, 2, f"Übergangsstudie {nummer}")
+            self.uebergangsblatt.cell(zeile, 3, 0.5)
+            self.uebergangsblatt.cell(zeile, 4, Untersuchung.PRAESENZ)
+            self.uebergangsblatt.cell(zeile, 5, "Testlehrperson Neu")
+
+        with BytesIO() as puffer:
+            self.uebergangsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertTrue(
+            any(m.startswith("A102:") for m in fehlerliste),
+            fehlerliste,
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_uebergang_ohne_teilnahmeangaben_wird_abgewiesen(self):
+        """Weist eine vollständig leere Übergangsliste ohne Änderung am Bestand ab."""
+        # Nur die Kopfzeile bleibt: Einzelne Leerzeilen sind zulässig, eine leere Liste nicht.
+        for spalte in range(1, 6):
+            self.uebergangsblatt.cell(row=2, column=spalte).value = None
+
+        with BytesIO() as puffer:
+            self.uebergangsmappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+
+        fehlerliste = importiere_uebergangsdatei(datei)
+
+        self.assertEqual(
+            fehlerliste,
+            ["Datei: Es sind keine Teilnahmeangaben vorhanden."],
+        )
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+
+class ImportDateiUndBlattTests(TestCase):
+    """Prüft Dateiformat, Dateigröße und zusätzliche Blätter beider Importwege."""
+
+    def setUp(self):
+        """Bereitet Altbestand und zwei gültige Vorlagen mit verschiedenen Studien vor."""
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+        self.xlsx_typ = (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        regulaere_mappe = Workbook()
+        self.addCleanup(regulaere_mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Reguläre Dateiprüfung",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            regulaere_mappe.active[adresse] = wert
+
+        uebergangsmappe = Workbook()
+        self.addCleanup(uebergangsmappe.close)
+        uebergangsmappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        uebergangsmappe.active.append([
+            1234567,
+            "Übergangsdateiprüfung",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+
+        # Jeder Teilfall wird über die zugehörige öffentliche Importfunktion geprüft.
+        # Verschiedene Studiennamen verhindern Kollisionen bei zwei Erfolgen im selben Test.
+        self.importe = [
+            ("regulaer", regulaere_mappe, importiere_untersuchung),
+            ("uebergang", uebergangsmappe, importiere_uebergangsdatei),
+        ]
+        self.grundgroessen = {}
+
+        # Für echte Byte-Grenzfälle wird die XLSX ohne ZIP-Kompression geschrieben.
+        # Ein vorhandenes Beschreibungszeichen lässt sich später bytegenau verlängern.
+        for weg, mappe, _ in self.importe:
+            mappe.properties.description = "x"
+            with BytesIO() as puffer:
+                with ZipFile(puffer, "w", compression=ZIP_STORED) as archiv:
+                    ExcelWriter(mappe, archiv).save()
+                self.grundgroessen[weg] = len(puffer.getvalue())
+
+    def test_qa05_falsche_dateiendung_wird_abgewiesen(self):
+        """Eine gültige XLSX-Datei wird unter einer unzulässigen Endung abgewiesen."""
+        for weg, mappe, importiere in self.importe:
+            for name in ["daten.xls", "daten.xlsx.exe"]:
+                with self.subTest(importweg=weg, dateiname=name):
+                    with BytesIO() as puffer:
+                        mappe.save(puffer)
+                        datei = SimpleUploadedFile(
+                            name, puffer.getvalue(), content_type=self.xlsx_typ
+                        )
+
+                    fehlerliste = importiere(datei)
+
+                    self.assertEqual(
+                        fehlerliste,
+                        ["Datei: Eine makrofreie .xlsx-Datei ist erforderlich."],
+                    )
+                    self.assertTrue(datei.closed)
+                    self.assertEqual(
+                        list(Untersuchung.objects.order_by("pk").values()),
+                        self.untersuchungsbestand,
+                    )
+                    self.assertEqual(
+                        list(Teilnahme.objects.order_by("pk").values()),
+                        self.teilnahmebestand,
+                    )
+
+    def test_qa05_umbenannte_excel_vorlage_wird_abgewiesen(self):
+        """Eine als XLSX benannte XLTX-Vorlage wird anhand ihres tatsächlichen Formats erkannt."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                # template=True erzeugt den Inhaltstyp XLTX, obwohl der Upload XLSX heißt.
+                mappe.template = True
+                with BytesIO() as puffer:
+                    mappe.save(puffer)
+                    datei = SimpleUploadedFile(
+                        "daten.xlsx", puffer.getvalue(), content_type=self.xlsx_typ
+                    )
+                mappe.template = False
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(
+                    fehlerliste,
+                    ["Datei: Eine makrofreie XLSX-Arbeitsmappe ist erforderlich."],
+                )
+                self.assertTrue(datei.closed)
+                self.assertEqual(
+                    list(Untersuchung.objects.order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_qa05_unlesbare_dateien_werden_kontrolliert_abgewiesen(self):
+        """Leere, fremde und beschädigte Inhalte liefern nur die allgemeine Dateimeldung."""
+        for weg, mappe, importiere in self.importe:
+            with BytesIO() as puffer:
+                mappe.save(puffer)
+                gueltige_bytes = puffer.getvalue()
+
+            for fall, inhalt in [
+                ("leer", b""),
+                ("Text statt XLSX", b"Keine Excel-Arbeitsmappe"),
+                ("abgeschnitten", gueltige_bytes[:len(gueltige_bytes) // 2]),
+            ]:
+                with self.subTest(importweg=weg, fall=fall):
+                    # Passender Dateiname und Medientyp ersetzen keine Inhaltsprüfung.
+                    datei = SimpleUploadedFile(
+                        "daten.xlsx", inhalt, content_type=self.xlsx_typ
+                    )
+
+                    fehlerliste = importiere(datei)
+
+                    self.assertEqual(
+                        fehlerliste,
+                        ["Datei: Die XLSX-Datei konnte nicht gelesen werden."],
+                    )
+                    self.assertTrue(datei.closed)
+                    self.assertEqual(
+                        list(Untersuchung.objects.order_by("pk").values()),
+                        self.untersuchungsbestand,
+                    )
+                    self.assertEqual(
+                        list(Teilnahme.objects.order_by("pk").values()),
+                        self.teilnahmebestand,
+                    )
+
+    def test_fa05_fa11_genau_2000000_byte_sind_zulaessig(self):
+        """Die echte Dateigrößengrenze bleibt mit XLSX-Endung und unspezifischem Medientyp zulässig."""
+        zielgroesse = 2_000_000
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                # Nur Beschreibungstext außerhalb der Eingabezellen verlängern.
+                # +1 berücksichtigt das Zeichen, das bereits in der Grundgröße enthalten ist.
+                mappe.properties.description = "x" * (
+                    zielgroesse - self.grundgroessen[weg] + 1
+                )
+                with BytesIO() as puffer:
+                    with ZipFile(puffer, "w", compression=ZIP_STORED) as archiv:
+                        ExcelWriter(mappe, archiv).save()
+                    inhalt = puffer.getvalue()
+
+                # Die tatsächlichen Bytes prüfen, nicht einen überschriebenen size-Wert.
+                self.assertEqual(len(inhalt), zielgroesse)
+                datei = SimpleUploadedFile(
+                    "daten.XLSX", inhalt, content_type="application/octet-stream"
+                )
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(fehlerliste, [])
+                self.assertTrue(datei.closed)
+
+        # Beide Importe müssen ihre Teilnahme tatsächlich gespeichert haben.
+        self.assertEqual(Untersuchung.objects.count(), 3)
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values_list("untersuchung__studienname", flat=True)
+            ),
+            ["Reguläre Dateiprüfung", "Übergangsdateiprüfung"],
+        )
+        self.assertEqual(
+            list(
+                Untersuchung.objects.filter(
+                    pk=self.untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    matrikelnummer="1234567"
+                ).order_by("pk").values()
+            ),
+            self.teilnahmebestand,
+        )
+
+    def test_fa05_fa11_2000001_byte_werden_abgewiesen(self):
+        """Eine ansonsten gültige XLSX-Datei ein Byte über der Grenze verändert keine Daten."""
+        zielgroesse = 2_000_001
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                mappe.properties.description = "x" * (
+                    zielgroesse - self.grundgroessen[weg] + 1
+                )
+                with BytesIO() as puffer:
+                    with ZipFile(puffer, "w", compression=ZIP_STORED) as archiv:
+                        ExcelWriter(mappe, archiv).save()
+                    inhalt = puffer.getvalue()
+
+                self.assertEqual(len(inhalt), zielgroesse)
+                datei = SimpleUploadedFile(
+                    "daten.xlsx", inhalt, content_type=self.xlsx_typ
+                )
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(
+                    fehlerliste,
+                    ["Datei: Höchstens 2.000.000 Byte sind zulässig."],
+                )
+                self.assertTrue(datei.closed)
+                self.assertEqual(
+                    list(Untersuchung.objects.order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_fa05_fa11_zusaetzliche_blaetter_werden_abgewiesen(self):
+        """Ein zusätzliches Blatt führt unabhängig von seiner Sichtbarkeit zur Abweisung."""
+        for weg, mappe, importiere in self.importe:
+            for zustand in ["visible", "hidden", "veryHidden"]:
+                with self.subTest(importweg=weg, blattzustand=zustand):
+                    zusatzblatt = mappe.create_sheet("Zusatz")
+                    zusatzblatt.sheet_state = zustand
+                    with BytesIO() as puffer:
+                        mappe.save(puffer)
+                        datei = SimpleUploadedFile(
+                            "daten.xlsx", puffer.getvalue(), content_type=self.xlsx_typ
+                        )
+
+                    # Die Arbeitsmappe vor dem nächsten Teilfall wieder auf ein Blatt setzen.
+                    mappe.remove(zusatzblatt)
+                    fehlerliste = importiere(datei)
+
+                    self.assertEqual(
+                        fehlerliste,
+                        ["Datei: Genau ein Tabellenblatt ohne weitere Blätter ist erforderlich."],
+                    )
+                    self.assertTrue(datei.closed)
+                    self.assertEqual(
+                        list(Untersuchung.objects.order_by("pk").values()),
+                        self.untersuchungsbestand,
+                    )
+                    self.assertEqual(
+                        list(Teilnahme.objects.order_by("pk").values()),
+                        self.teilnahmebestand,
+                    )
+
+
+class ImportZipXmlTests(TestCase):
+    """Prüft die ZIP-Grenzen und das geschützte XML-Einlesen beider Importwege."""
+
+    def setUp(self):
+        """Bereitet einen Altbestand und zwei gültige XLSX-Dateien im Speicher vor."""
+        untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        regulaere_mappe = Workbook()
+        self.addCleanup(regulaere_mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "ZIP-Prüfung regulär",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            regulaere_mappe.active[adresse] = wert
+
+        uebergangsmappe = Workbook()
+        self.addCleanup(uebergangsmappe.close)
+        uebergangsmappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        uebergangsmappe.active.append([
+            1234567,
+            "ZIP-Prüfung Übergang",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+
+        self.importe = []
+        for weg, mappe, importiere, studienname in [
+            (
+                "regulaer", regulaere_mappe,
+                importiere_untersuchung, "ZIP-Prüfung regulär",
+            ),
+            (
+                "uebergang", uebergangsmappe,
+                importiere_uebergangsdatei, "ZIP-Prüfung Übergang",
+            ),
+        ]:
+            # Die Beschreibung liegt außerhalb der Eingabezellen. Ihr kurzer
+            # Marker lässt sich später ohne zusätzliche XML-Elemente verlängern.
+            mappe.properties.description = "ZIP_GROESSEN_TEST"
+            with BytesIO() as puffer:
+                mappe.save(puffer)
+                self.importe.append(
+                    (weg, puffer.getvalue(), importiere, studienname)
+                )
+
+    def _packe_xlsx(self, inhalt, ersetzungen=None, zusatzanzahl=0):
+        """Erzeugt ein neues ZIP-Paket mit echten Inhalten und neu berechneten Prüfsummen."""
+        ersetzungen = ersetzungen or {}
+        with BytesIO(inhalt) as quelle, BytesIO() as ziel:
+            with ZipFile(quelle) as original:
+                with ZipFile(ziel, "w", compression=ZIP_DEFLATED) as neu:
+                    for eintrag in original.infolist():
+                        daten = ersetzungen.get(
+                            eintrag.filename, original.read(eintrag.filename)
+                        )
+                        neu.writestr(eintrag.filename, daten)
+
+                    # Auch leere Verzeichniseinträge zählen zur ZIP-Grenze.
+                    # Sie ändern weder Vorlage noch Untersuchungsangaben.
+                    for nummer in range(zusatzanzahl):
+                        neu.writestr(f"testzusatz/{nummer}/", b"")
+            return ziel.getvalue()
+
+    def _pruefe_abweisung(self, inhalt, importiere, meldung):
+        """Prüft die Dateimeldung, den geschlossenen Upload und den vollständigen Altbestand."""
+        # Die Uploadgrenze darf die hier untersuchte ZIP-/XML-Prüfung nicht verdecken.
+        self.assertLessEqual(len(inhalt), 2_000_000)
+        datei = SimpleUploadedFile("daten.xlsx", inhalt)
+        self.addCleanup(datei.close)
+
+        fehlerliste = importiere(datei)
+
+        self.assertEqual(fehlerliste, [meldung])
+        self.assertTrue(datei.closed)
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def _pruefe_erfolg(self, inhalt, importiere, studienname):
+        """Prüft die tatsächliche Übernahme genau einer Untersuchung und ihrer Teilnahme."""
+        vorherige_untersuchungen = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        vorherige_teilnahmen = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+        self.assertLessEqual(len(inhalt), 2_000_000)
+        datei = SimpleUploadedFile("daten.xlsx", inhalt)
+        self.addCleanup(datei.close)
+
+        fehlerliste = importiere(datei)
+
+        self.assertEqual(fehlerliste, [])
+        self.assertTrue(datei.closed)
+        neue_untersuchung = Untersuchung.objects.get(studienname=studienname)
+        self.assertEqual(
+            list(
+                Teilnahme.objects.filter(
+                    untersuchung=neue_untersuchung
+                ).values_list("matrikelnummer", flat=True)
+            ),
+            ["1234567"],
+        )
+        self.assertEqual(
+            list(
+                Untersuchung.objects.exclude(
+                    pk=neue_untersuchung.pk
+                ).order_by("pk").values()
+            ),
+            vorherige_untersuchungen,
+        )
+        self.assertEqual(
+            list(
+                Teilnahme.objects.exclude(
+                    untersuchung=neue_untersuchung
+                ).order_by("pk").values()
+            ),
+            vorherige_teilnahmen,
+        )
+
+    def test_qa05_genau_100_zip_eintraege_sind_zulaessig(self):
+        """Eine gültige XLSX-Datei mit genau 100 ZIP-Einträgen wird übernommen."""
+        for weg, inhalt, importiere, studienname in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    grundanzahl = len(archiv.infolist())
+                self.assertLess(grundanzahl, 100)
+                inhalt = self._packe_xlsx(
+                    inhalt, zusatzanzahl=100 - grundanzahl
+                )
+
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    self.assertEqual(len(archiv.infolist()), 100)
+                    self.assertIsNone(archiv.testzip())
+
+                self._pruefe_erfolg(inhalt, importiere, studienname)
+
+    def test_qa05_101_zip_eintraege_werden_abgewiesen(self):
+        """Ein zusätzlicher ZIP-Eintrag führt vor der Datenübernahme zur Abweisung."""
+        for weg, inhalt, importiere, _ in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    grundanzahl = len(archiv.infolist())
+                self.assertLess(grundanzahl, 101)
+                inhalt = self._packe_xlsx(
+                    inhalt, zusatzanzahl=101 - grundanzahl
+                )
+
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    self.assertEqual(len(archiv.infolist()), 101)
+                    self.assertIsNone(archiv.testzip())
+
+                self._pruefe_abweisung(
+                    inhalt, importiere,
+                    "Datei: Höchstens 100 ZIP-Einträge sind zulässig.",
+                )
+
+    def test_qa05_genau_20_mib_entpackt_sind_zulaessig(self):
+        """Die tatsächliche entpackte Gesamtgröße darf genau 20 MiB betragen."""
+        zielgroesse = 20 * 1024 * 1024
+        for weg, inhalt, importiere, studienname in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    grundgroesse = sum(
+                        len(archiv.read(name)) for name in archiv.namelist()
+                    )
+                    beschreibung = archiv.read("docProps/core.xml")
+
+                # Komprimierbarer Beschreibungstext erhöht die tatsächlichen
+                # ZIP-Inhalte, während die Uploaddatei deutlich unter 2 MB bleibt.
+                # Die ZIP-Größenangaben selbst werden nicht manipuliert.
+                self.assertEqual(beschreibung.count(b"ZIP_GROESSEN_TEST"), 1)
+                beschreibung = beschreibung.replace(
+                    b"ZIP_GROESSEN_TEST",
+                    b"ZIP_GROESSEN_TEST" + b"x" * (zielgroesse - grundgroesse),
+                    1,
+                )
+                inhalt = self._packe_xlsx(
+                    inhalt, {"docProps/core.xml": beschreibung}
+                )
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    # read() liest echte Bytes und kontrolliert zugleich die CRC.
+                    self.assertEqual(
+                        sum(len(archiv.read(name)) for name in archiv.namelist()),
+                        zielgroesse,
+                    )
+
+                self._pruefe_erfolg(inhalt, importiere, studienname)
+
+    def test_qa05_20_mib_plus_ein_byte_werden_abgewiesen(self):
+        """Ein Byte über der entpackten ZIP-Grenze verhindert jede Datenänderung."""
+        zielgroesse = 20 * 1024 * 1024 + 1
+        for weg, inhalt, importiere, _ in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    grundgroesse = sum(
+                        len(archiv.read(name)) for name in archiv.namelist()
+                    )
+                    beschreibung = archiv.read("docProps/core.xml")
+
+                self.assertEqual(beschreibung.count(b"ZIP_GROESSEN_TEST"), 1)
+                beschreibung = beschreibung.replace(
+                    b"ZIP_GROESSEN_TEST",
+                    b"ZIP_GROESSEN_TEST" + b"x" * (zielgroesse - grundgroesse),
+                    1,
+                )
+                inhalt = self._packe_xlsx(
+                    inhalt, {"docProps/core.xml": beschreibung}
+                )
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    self.assertEqual(
+                        sum(len(archiv.read(name)) for name in archiv.namelist()),
+                        zielgroesse,
+                    )
+
+                self._pruefe_abweisung(
+                    inhalt, importiere,
+                    "Datei: Die entpackte Gesamtgröße überschreitet 20 MiB.",
+                )
+
+    def test_qa05_xml_entitaet_im_manifest_wird_abgewiesen(self):
+        """Eine harmlose Entity-Deklaration im Paketmanifest genügt zur sicheren Abweisung."""
+        for weg, inhalt, importiere, _ in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    manifest = archiv.read("[Content_Types].xml")
+
+                # Die Entität wird nur deklariert, nicht verwendet oder verschachtelt.
+                # Es gibt weder externe Adressen noch eine Textvervielfachung.
+                self.assertIn(b"<Types", manifest)
+                manifest = manifest.replace(
+                    b"<Types",
+                    b'<!DOCTYPE Types [<!ENTITY testwert "sicher">]><Types',
+                    1,
+                )
+                with self.assertRaises(EntitiesForbidden):
+                    geschuetztes_xml(manifest)
+                inhalt = self._packe_xlsx(
+                    inhalt, {"[Content_Types].xml": manifest}
+                )
+
+                self._pruefe_abweisung(
+                    inhalt, importiere,
+                    "Datei: Die XLSX-Datei konnte nicht gelesen werden.",
+                )
+
+    def test_qa05_xml_entitaet_im_tabellenblatt_wird_abgewiesen(self):
+        """Auch das Einlesen der Zellen weist Entity-Deklarationen sicher zurück."""
+        for weg, inhalt, importiere, _ in self.importe:
+            with self.subTest(importweg=weg):
+                with ZipFile(BytesIO(inhalt)) as archiv:
+                    blatt_xml = archiv.read("xl/worksheets/sheet1.xml")
+
+                # Das unveränderte Manifest passiert die erste XML-Prüfung.
+                # Die Entity-Deklaration erreicht deshalb den Worksheet-Parser.
+                self.assertIn(b"<worksheet", blatt_xml)
+                blatt_xml = blatt_xml.replace(
+                    b"<worksheet",
+                    b'<!DOCTYPE worksheet [<!ENTITY testwert "sicher">]><worksheet',
+                    1,
+                )
+                with self.assertRaises(EntitiesForbidden):
+                    geschuetztes_xml(blatt_xml)
+                inhalt = self._packe_xlsx(
+                    inhalt, {"xl/worksheets/sheet1.xml": blatt_xml}
+                )
+
+                self._pruefe_abweisung(
+                    inhalt, importiere,
+                    "Datei: Die XLSX-Datei konnte nicht gelesen werden.",
+                )
+
+    def test_qa05_ohne_xml_schutz_wird_nicht_eingelesen(self):
+        """Ein fehlender XML-Schutz wird gemeldet, statt ungeschützt weiterzulesen."""
+        for weg, inhalt, importiere, _ in self.importe:
+            with self.subTest(importweg=weg):
+                # Nur die Schutzverfügbarkeit simulieren. Der ungeeignete Zustand
+                # darf keinen Aufruf der eigentlichen Ladefunktion auslösen.
+                with patch("vp_stunden.importe.DEFUSEDXML", False):
+                    with patch("vp_stunden.importe.load_workbook") as lade_mappe:
+                        self._pruefe_abweisung(
+                            inhalt, importiere,
+                            "Datei: Sicheres XML-Einlesen ist nicht verfügbar.",
+                        )
+                        lade_mappe.assert_not_called()
+
+
+class ImportMakroVerknuepfungsTests(TestCase):
+    """Prüft makrofreie Pakete und die Abweisung externer Verknüpfungen beider Importe."""
+
+    def setUp(self):
+        """Bereitet Altbestand und je eine gültige Vorlage für beide Importwege vor."""
+        untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        regulaere_mappe = Workbook()
+        self.addCleanup(regulaere_mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Reguläre Makroprüfung",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            regulaere_mappe.active[adresse] = wert
+
+        uebergangsmappe = Workbook()
+        self.addCleanup(uebergangsmappe.close)
+        uebergangsmappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        uebergangsmappe.active.append([
+            1234567,
+            "Übergangsmakroprüfung",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+        self.importe = [
+            ("regulaer", regulaere_mappe, importiere_untersuchung),
+            ("uebergang", uebergangsmappe, importiere_uebergangsdatei),
+        ]
+
+    def _xlsx_bytes(self, mappe):
+        """Schreibt die vorbereitete Arbeitsmappe als XLSX-Bytes im Arbeitsspeicher."""
+        with BytesIO() as puffer:
+            mappe.save(puffer)
+            return puffer.getvalue()
+
+    def _paket_aendern(self, inhalt, ersetzungen):
+        """Ersetzt oder ergänzt Paketbestandteile und berechnet ihre ZIP-Prüfsummen neu."""
+        with BytesIO(inhalt) as quelle, BytesIO() as ziel:
+            with ZipFile(quelle) as alt, ZipFile(
+                ziel, "w", compression=ZIP_DEFLATED
+            ) as neu:
+                for name in alt.namelist():
+                    daten = ersetzungen.get(name)
+                    if daten is None:
+                        daten = alt.read(name)
+                    neu.writestr(name, daten)
+                for name, daten in ersetzungen.items():
+                    if name not in alt.namelist():
+                        neu.writestr(name, daten)
+            return ziel.getvalue()
+
+    def _pruefe_abweisung(self, importiere, inhalt, meldung):
+        """Prüft die konkrete Dateimeldung, geschlossenen Upload und vollständigen Bestand."""
+        datei = SimpleUploadedFile("daten.xlsx", inhalt)
+        self.addCleanup(datei.close)
+
+        fehlerliste = importiere(datei)
+
+        self.assertEqual(fehlerliste, [meldung])
+        self.assertTrue(datei.closed)
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa05_fa11_umbenannte_makroformate_werden_abgewiesen(self):
+        """XLSM- und XLTM-Haupttypen werden auch unter dem Dateinamen daten.xlsx erkannt."""
+        for weg, mappe, importiere in self.importe:
+            grundinhalt = self._xlsx_bytes(mappe)
+            for haupttyp in [XLSM, XLTM]:
+                with self.subTest(importweg=weg, haupttyp=haupttyp):
+                    with ZipFile(BytesIO(grundinhalt)) as archiv:
+                        manifest = ElementTree.fromstring(
+                            archiv.read("[Content_Types].xml")
+                        )
+
+                    # Nur den tatsächlichen Haupttyp ändern, keine Makros erzeugen.
+                    for element in manifest:
+                        if element.get("ContentType") == XLSX:
+                            element.set("ContentType", haupttyp)
+                    inhalt = self._paket_aendern(grundinhalt, {
+                        "[Content_Types].xml": ElementTree.tostring(manifest),
+                    })
+
+                    self._pruefe_abweisung(
+                        importiere,
+                        inhalt,
+                        "Datei: Eine makrofreie XLSX-Arbeitsmappe ist erforderlich.",
+                    )
+
+    def test_fa05_fa11_vba_deklarationen_werden_abgewiesen(self):
+        """VBA-Deklarationen werden sowohl als Standardtyp als auch als Einzeltyp abgewiesen."""
+        for weg, mappe, importiere in self.importe:
+            grundinhalt = self._xlsx_bytes(mappe)
+            for deklaration in ["Default", "Override"]:
+                with self.subTest(importweg=weg, deklaration=deklaration):
+                    with ZipFile(BytesIO(grundinhalt)) as archiv:
+                        manifest = ElementTree.fromstring(
+                            archiv.read("[Content_Types].xml")
+                        )
+                        beziehungen = ElementTree.fromstring(
+                            archiv.read("xl/_rels/workbook.xml.rels")
+                        )
+
+                    # Default erklärt den Typ einer Dateiendung, Override
+                    # den Typ eines einzelnen Bestandteils im Paket.
+                    attribute = {"ContentType": VBA}
+                    if deklaration == "Default":
+                        attribute["Extension"] = "bin"
+                    else:
+                        attribute["PartName"] = "/xl/vbaProject.bin"
+                    ElementTree.SubElement(
+                        manifest, f"{{{CONTYPES_NS}}}{deklaration}", attribute
+                    )
+                    # Die Beziehung ordnet den synthetischen Marker der Mappe zu.
+                    ElementTree.SubElement(
+                        beziehungen,
+                        f"{{{PKG_REL_NS}}}Relationship",
+                        {
+                            "Id": "rIdSynthetischesVba",
+                            "Type": (
+                                "http://schemas.microsoft.com/office/2006/"
+                                "relationships/vbaProject"
+                            ),
+                            "Target": "vbaProject.bin",
+                        },
+                    )
+                    # Der XLSX-Haupttyp bleibt erhalten. Der binäre Bestandteil
+                    # enthält nur eine Markierung, keinen ausführbaren VBA-Code.
+                    inhalt = self._paket_aendern(grundinhalt, {
+                        "[Content_Types].xml": ElementTree.tostring(manifest),
+                        "xl/_rels/workbook.xml.rels": ElementTree.tostring(beziehungen),
+                        "xl/vbaProject.bin": b"SYNTHETISCHER VBA-TESTMARKER",
+                    })
+
+                    self._pruefe_abweisung(
+                        importiere,
+                        inhalt,
+                        "Datei: Makrobestandteile sind nicht zulässig.",
+                    )
+
+    def test_fa05_fa11_makroblatt_deklaration_wird_abgewiesen(self):
+        """Ein deklarierter Makroblattbestandteil wird trotz unverändertem XLSX-Haupttyp abgewiesen."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                grundinhalt = self._xlsx_bytes(mappe)
+                with ZipFile(BytesIO(grundinhalt)) as archiv:
+                    manifest = ElementTree.fromstring(
+                        archiv.read("[Content_Types].xml")
+                    )
+
+                ElementTree.SubElement(
+                    manifest,
+                    f"{{{CONTYPES_NS}}}Override",
+                    {
+                        "PartName": "/xl/macrosheets/sheet1.xml",
+                        "ContentType": "application/vnd.ms-excel.macrosheet+xml",
+                    },
+                )
+                # Ein leerer XML-Marker genügt: Entscheidend ist die Deklaration.
+                # Es werden keine Makrobefehle oder ausführbaren Inhalte angelegt.
+                inhalt = self._paket_aendern(grundinhalt, {
+                    "[Content_Types].xml": ElementTree.tostring(manifest),
+                    "xl/macrosheets/sheet1.xml": (
+                        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+                        b'spreadsheetml/2006/main"><sheetData/></worksheet>'
+                    ),
+                })
+
+                self._pruefe_abweisung(
+                    importiere,
+                    inhalt,
+                    "Datei: Makrobestandteile sind nicht zulässig.",
+                )
+
+    def test_qa05_externe_arbeitsmappenverknuepfungen_werden_abgewiesen(self):
+        """Echte externe Verweise auf synthetische Web- und Dateiziele führen zur Abweisung."""
+        for weg, mappe, importiere in self.importe:
+            for ziel in [
+                "https://arbeitsmappe.invalid/synthetische-quelle.xlsx",
+                "file:///synthetische-testquelle.xlsx",
+            ]:
+                with self.subTest(importweg=weg, ziel=ziel):
+                    verknuepfung = ExternalLink(externalBook=ExternalBook(
+                        sheetNames=ExternalSheetNames(sheetName=["Synthetische Quelle"]),
+                        id="rId1",
+                    ))
+                    verknuepfung.file_link = Relationship(
+                        Id="rId1",
+                        type="externalLinkPath",
+                        Target=ziel,
+                        TargetMode="External",
+                    )
+                    # Die private openpyxl-3.1.5-Liste wird mit echten Metadaten
+                    # gefüllt, nicht durch eine vorgetäuschte Ladeantwort ersetzt.
+                    mappe._external_links = [verknuepfung]
+                    inhalt = self._xlsx_bytes(mappe)
+                    mappe._external_links = []
+
+                    with BytesIO(inhalt) as puffer:
+                        geladen = load_workbook(puffer, keep_links=True)
+                        try:
+                            self.assertEqual(len(geladen._external_links), 1)
+                            self.assertEqual(
+                                geladen._external_links[0].file_link.Target, ziel
+                            )
+                        finally:
+                            geladen.close()
+
+                    # openpyxl liest die Verweismetadaten aus dem ZIP-Paket.
+                    # Die Zielarbeitsmappe wird dabei weder geöffnet noch geladen.
+                    self._pruefe_abweisung(
+                        importiere,
+                        inhalt,
+                        "Datei: Externe Arbeitsmappenverknüpfungen sind nicht zulässig.",
+                    )
+
+
+class ImportFormelTests(TestCase):
+    """Prüft die vollständige Abweisung echter Excel-Formeln in beiden Importwegen."""
+
+    def setUp(self):
+        """Bereitet Altbestand und gültige Vorlagen mit je einer Teilnahme vor."""
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        regulaere_mappe = Workbook()
+        self.addCleanup(regulaere_mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Formelprüfung regulär",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            regulaere_mappe.active[adresse] = wert
+
+        uebergangsmappe = Workbook()
+        self.addCleanup(uebergangsmappe.close)
+        uebergangsmappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        uebergangsmappe.active.append([
+            1234567,
+            "Formelprüfung Übergang",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+        self.importe = [
+            ("regulaer", regulaere_mappe, importiere_untersuchung),
+            ("uebergang", uebergangsmappe, importiere_uebergangsdatei),
+        ]
+
+    def _upload(self, mappe):
+        """Erzeugt für jeden Import einen eigenen XLSX-Upload im Arbeitsspeicher."""
+        with BytesIO() as puffer:
+            mappe.save(puffer)
+            datei = SimpleUploadedFile("daten.xlsx", puffer.getvalue())
+        self.addCleanup(datei.close)
+        return datei
+
+    def _pruefe_abweisung(self, mappe, importiere, erwartete_meldungen):
+        """Prüft gesammelte Zellmeldungen und den vollständigen unveränderten Bestand."""
+        datei = self._upload(mappe)
+
+        fehlerliste = importiere(datei)
+
+        # Die Reihenfolge der vorhandenen Zellen ist kein Erfolgskriterium.
+        # Jede erwartete Meldung muss aber genau einmal enthalten sein.
+        self.assertCountEqual(fehlerliste, erwartete_meldungen)
+        self.assertTrue(datei.closed)
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_qa05_formeln_in_eingabezellen_werden_gesammelt_abgewiesen(self):
+        """Erkennt Formeln in allen fünf Feldarten, auch nach Lücken am Bereichsende."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                if weg == "regulaer":
+                    formeln = {
+                        "B1": '="Formelstudie"',
+                        "B2": "=1/2",
+                        "B3": '="P"',
+                        "B4": '="Testlehrperson Neu"',
+                        "A106": "=1234567",
+                    }
+                else:
+                    formeln = {
+                        "A101": "=1234567",
+                        "B101": '="Formelstudie"',
+                        "C101": "=1/2",
+                        "D101": '="P"',
+                        "E101": '="Testlehrperson Neu"',
+                    }
+
+                # Die Ausdrücke würden passende Feldwerte ergeben. Abgewiesen
+                # wird die Formel selbst, unabhängig von ihrem möglichen Ergebnis.
+                for adresse, formel in formeln.items():
+                    mappe.active[adresse] = formel
+                    self.assertEqual(mappe.active[adresse].data_type, "f")
+
+                self._pruefe_abweisung(mappe, importiere, [
+                    f"{adresse}: Formeln sind nicht zulässig."
+                    for adresse in formeln
+                ])
+
+    def test_qa05_formeln_in_beschriftungen_werden_abgewiesen(self):
+        """Auch feste Vorlagenbeschriftungen müssen Zellwerte ohne Formeln enthalten."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                adressen = (
+                    ["A1", "A2", "A3", "A4", "A6"]
+                    if weg == "regulaer"
+                    else ["A1", "B1", "C1", "D1", "E1"]
+                )
+                for adresse in adressen:
+                    beschriftung = mappe.active[adresse].value
+                    mappe.active[adresse] = f'="{beschriftung}"'
+
+                self._pruefe_abweisung(mappe, importiere, [
+                    f"{adresse}: Formeln sind nicht zulässig."
+                    for adresse in adressen
+                ])
+
+    def test_qa05_formeln_ausserhalb_der_vorlage_werden_abgewiesen(self):
+        """Die Formelprüfung erfasst auch Zellen neben und unter dem erlaubten Bereich."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                adressen = (
+                    ["C5", "A107"] if weg == "regulaer" else ["F2", "A102"]
+                )
+                erwartete_meldungen = []
+                for adresse in adressen:
+                    mappe.active[adresse] = "=1+1"
+                    # Beide Fehlerursachen gehören zu derselben Zellfundstelle.
+                    erwartete_meldungen.extend([
+                        f"{adresse}: Formeln sind nicht zulässig.",
+                        f"{adresse}: Außerhalb der Vorlage sind keine Inhalte zulässig.",
+                    ])
+
+                self._pruefe_abweisung(mappe, importiere, erwartete_meldungen)
+
+    def test_qa05_gleichheitszeichen_in_text_bleibt_zulaessig(self):
+        """Ein Gleichheitszeichen innerhalb normalen Textes macht daraus keine Formel."""
+        for anzahl, (weg, mappe, importiere) in enumerate(self.importe, start=1):
+            with self.subTest(importweg=weg):
+                studienname = f"Formelprüfung = {weg}"
+                namenszelle = "B1" if weg == "regulaer" else "B2"
+                lehrpersonzelle = "B4" if weg == "regulaer" else "E2"
+                mappe.active[namenszelle] = studienname
+                mappe.active[lehrpersonzelle] = "Testlehrperson = Neu"
+                datei = self._upload(mappe)
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(fehlerliste, [])
+                self.assertTrue(datei.closed)
+                untersuchung = Untersuchung.objects.get(studienname=studienname)
+                self.assertEqual(untersuchung.lehrperson, "Testlehrperson = Neu")
+                self.assertTrue(Teilnahme.objects.filter(
+                    untersuchung=untersuchung, matrikelnummer="1234567"
+                ).exists())
+                self.assertEqual(Untersuchung.objects.count(), 1 + anzahl)
+                self.assertEqual(Teilnahme.objects.count(), 1 + anzahl)
+                self.assertEqual(
+                    list(Untersuchung.objects.filter(
+                        pk=self.untersuchung.pk
+                    ).order_by("pk").values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.exclude(
+                        matrikelnummer="1234567"
+                    ).order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+
+class ImportDateibereinigungTests(TestCase):
+    """Prüft die Entfernung tatsächlicher Django-Uploaddateien nach QA-05/QA-06."""
+
+    def setUp(self):
+        """Bereitet Altbestand, Vorlagen und ein begrenztes Uploadverzeichnis vor."""
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        # Später registrierte Aufräumfunktionen laufen zuerst. Die Uploads
+        # werden daher geschlossen, bevor ihr Testverzeichnis entfernt wird.
+        temporaerverzeichnis = TemporaryDirectory()
+        self.addCleanup(temporaerverzeichnis.cleanup)
+        self.enterContext(self.settings(FILE_UPLOAD_TEMP_DIR=temporaerverzeichnis.name))
+
+        regulaere_mappe = Workbook()
+        self.addCleanup(regulaere_mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Reguläre Bereinigungsprüfung",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+        }.items():
+            regulaere_mappe.active[adresse] = wert
+
+        uebergangsmappe = Workbook()
+        self.addCleanup(uebergangsmappe.close)
+        uebergangsmappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        uebergangsmappe.active.append([
+            1234567,
+            "Übergangsbereinigungsprüfung",
+            0.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Neu",
+        ])
+        self.importe = [
+            ("regulaer", regulaere_mappe, importiere_untersuchung),
+            ("uebergang", uebergangsmappe, importiere_uebergangsdatei),
+        ]
+
+    def _temporaerer_upload(self, mappe, dateiname="daten.xlsx"):
+        """Erzeugt einen echten Django-Datenträgerupload aus XLSX-Bytes."""
+        with BytesIO() as puffer:
+            mappe.save(puffer)
+            inhalt = puffer.getvalue()
+
+        # Die Bytes entstehen im Speicher. Nur der zu prüfende Django-Upload
+        # liegt auf Datenträger, ohne eine weitere Excel-Zwischenkopie.
+        datei = TemporaryUploadedFile(
+            dateiname,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            len(inhalt),
+            None,
+        )
+        self.addCleanup(datei.close)
+        datei.write(inhalt)
+        datei.seek(0)
+        pfad = Path(datei.temporary_file_path())
+        self.assertTrue(pfad.is_file())
+        self.assertFalse(datei.closed)
+        return datei, pfad
+
+    def _pruefe_bereinigung(self, datei, pfad):
+        """Prüft Schließen und Entfernung vor der allgemeinen Testbereinigung."""
+        self.assertTrue(datei.closed)
+        self.assertFalse(pfad.exists())
+
+    def _pruefe_unveraenderten_bestand(self):
+        """Vergleicht sämtliche alten Feldwerte und erkennt zusätzliche Datensätze."""
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_qa06_temporaerer_upload_wird_nach_erfolg_entfernt(self):
+        """Beide Importe speichern ihre Daten und entfernen den Datenträgerupload."""
+        for anzahl, (weg, mappe, importiere) in enumerate(self.importe, start=1):
+            with self.subTest(importweg=weg):
+                datei, pfad = self._temporaerer_upload(mappe)
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(fehlerliste, [])
+                self._pruefe_bereinigung(datei, pfad)
+                self.assertEqual(Untersuchung.objects.count(), 1 + anzahl)
+                self.assertEqual(Teilnahme.objects.count(), 1 + anzahl)
+
+                # Die neuen Namen unterscheiden sich. Alte Untersuchungswerte
+                # und die alte Teilnahme müssen in beiden Teilfällen gleich bleiben.
+                self.assertEqual(
+                    list(Untersuchung.objects.filter(
+                        pk=self.untersuchung.pk
+                    ).values()),
+                    self.untersuchungsbestand,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.exclude(
+                        matrikelnummer="1234567"
+                    ).order_by("pk").values()),
+                    self.teilnahmebestand,
+                )
+
+    def test_qa06_temporaerer_upload_wird_nach_frueher_abweisung_entfernt(self):
+        """Bereinigt den Upload auch bei einer Abweisung vor dem XLSX-Einlesen."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                datei, pfad = self._temporaerer_upload(mappe, "daten.xls")
+
+                fehlerliste = importiere(datei)
+
+                self.assertEqual(
+                    fehlerliste,
+                    ["Datei: Eine makrofreie .xlsx-Datei ist erforderlich."],
+                )
+                self._pruefe_bereinigung(datei, pfad)
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_temporaerer_upload_wird_nach_zellfehler_entfernt(self):
+        """Bereinigt nach einer Zellabweisung die geladene Uploaddatei ohne Datenänderung."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                adresse = "B2" if weg == "regulaer" else "C2"
+                mappe.active[adresse] = 0.25
+                datei, pfad = self._temporaerer_upload(mappe)
+
+                fehlerliste = importiere(datei)
+
+                self.assertTrue(
+                    any(m.startswith(f"{adresse}:") for m in fehlerliste),
+                    fehlerliste,
+                )
+                self._pruefe_bereinigung(datei, pfad)
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_temporaerer_upload_wird_nach_speicherfehler_entfernt(self):
+        """Bereinigt den Upload und nimmt eine bereits gespeicherte Untersuchung zurück."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                datei, pfad = self._temporaerer_upload(mappe)
+
+                # wraps lässt die neue Untersuchung tatsächlich speichern.
+                # Der Fehler beim Anlegen der Teilnahme muss sie wieder zurücknehmen.
+                with patch(
+                    "vp_stunden.importe.Untersuchung.objects.create",
+                    wraps=Untersuchung.objects.create,
+                ) as untersuchungsspeicherung, patch(
+                    "vp_stunden.importe.Teilnahme.objects.create",
+                    side_effect=DatabaseError("INTERNER_TESTFEHLER"),
+                ):
+                    fehlerliste = importiere(datei)
+
+                self.assertEqual(untersuchungsspeicherung.call_count, 1)
+                bezeichnung = "Der Import" if weg == "regulaer" else "Der Übergangsimport"
+                self.assertEqual(
+                    fehlerliste,
+                    [f"Datei: {bezeichnung} konnte nicht übernommen werden."],
+                )
+                self._pruefe_bereinigung(datei, pfad)
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_temporaerer_upload_wird_nach_unerwartetem_fehler_entfernt(self):
+        """Bereinigt nach unerwartetem Verarbeitungsfehler und verbirgt dessen Interna."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                datei, pfad = self._temporaerer_upload(mappe)
+
+                with patch(
+                    "vp_stunden.importe.pruefe_studienname",
+                    side_effect=RuntimeError("INTERNER_TESTFEHLER"),
+                ):
+                    fehlerliste = importiere(datei)
+
+                bezeichnung = "Der Import" if weg == "regulaer" else "Der Übergangsimport"
+                self.assertEqual(
+                    fehlerliste,
+                    [f"Datei: {bezeichnung} konnte nicht verarbeitet werden."],
+                )
+                self._pruefe_bereinigung(datei, pfad)
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_upload_schliesst_auch_wenn_arbeitsmappenschliessen_scheitert(self):
+        """Prüft die Uploadbereinigung trotz einer weitergegebenen close-Ausnahme."""
+        for weg, mappe, importiere in self.importe:
+            with self.subTest(importweg=weg):
+                adresse = "B2" if weg == "regulaer" else "C2"
+                mappe.active[adresse] = 0.25
+                datei, pfad = self._temporaerer_upload(mappe)
+
+                # Die ungültige Vorlage verhindert Speicherung. Der zusätzliche
+                # close-Fehler verlässt finally, dessen innerer Aufräumschritt
+                # muss den Upload dennoch schließen und entfernen.
+                with patch(
+                    "openpyxl.workbook.workbook.Workbook.close",
+                    side_effect=RuntimeError("INTERNER_SCHLIESSFEHLER"),
+                ):
+                    with self.assertRaisesMessage(RuntimeError, "INTERNER_SCHLIESSFEHLER"):
+                        importiere(datei)
+
+                self._pruefe_bereinigung(datei, pfad)
+                self._pruefe_unveraenderten_bestand()
+
+
+class RegulaererImportViewTests(TestCase):
+    """Prüft reguläre Uploads über URL, Sitzung, CSRF-Schutz und Importfunktion."""
+
+    def setUp(self):
+        """Bereitet Altbestand, gültige Vorlage und einen Client mit aktivem CSRF-Schutz vor."""
+        self.url = "/untersuchung_importieren/"
+        untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        self.mappe = Workbook()
+        self.addCleanup(self.mappe.close)
+        for adresse, wert in {
+            "A1": "Studienname",
+            "A2": "Stundenwert (VP-Stunden)",
+            "A3": "Einordnung (P/O)",
+            "A4": "Verantwortliche Lehrperson",
+            "A6": "Matrikelnummer",
+            "B1": "Neue Uploadstudie",
+            "B2": 0.5,
+            "B3": Untersuchung.PRAESENZ,
+            "B4": "Testlehrperson Neu",
+            "A7": 1234567,
+            "A8": 2345678,
+        }.items():
+            self.mappe.active[adresse] = wert
+
+        # Djangos gewöhnlicher Testclient überspringt die CSRF-Prüfung.
+        # Hier wird sie aktiviert und bereitet ein gültiges Testcookie vor.
+        self.client = Client(enforce_csrf_checks=True)
+        anfrage = HttpRequest()
+        get_token(anfrage)
+        self.client.cookies[settings.CSRF_COOKIE_NAME] = anfrage.META["CSRF_COOKIE"]
+
+    def _melde_testkonto_an(self, rolle):
+        """Meldet ein synthetisches Rollenkonto mit den erforderlichen Sitzungszeitwerten an."""
+        benutzername = f"upload_{rolle}"
+        passwort = "a" * 64
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertEqual(fehlerliste, [])
+
+        antwort = self.client.post(
+            "/anmelden/",
+            data={"benutzername": benutzername, "passwort": passwort},
+            HTTP_X_CSRFTOKEN=self.client.cookies[settings.CSRF_COOKIE_NAME].value,
+        )
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+
+    def _upload(self):
+        """Erzeugt für jede Anfrage einen eigenen XLSX-Upload im Arbeitsspeicher."""
+        with BytesIO() as puffer:
+            self.mappe.save(puffer)
+            datei = SimpleUploadedFile("untersuchung.xlsx", puffer.getvalue())
+        self.addCleanup(datei.close)
+        return datei
+
+    def _post(self, daten):
+        """Sendet eine Uploadanfrage mit dem aktuell gültigen CSRF-Token."""
+        # Die Anmeldung wechselt das CSRF-Geheimnis. Deshalb immer den
+        # aktuellen Cookiewert verwenden, nicht den Wert vor der Anmeldung.
+        return self.client.post(
+            self.url,
+            data=daten,
+            HTTP_X_CSRFTOKEN=self.client.cookies[settings.CSRF_COOKIE_NAME].value,
+        )
+
+    def _pruefe_unveraenderten_bestand(self):
+        """Vergleicht sämtliche Untersuchungs- und Teilnahmefeldwerte mit dem Altbestand."""
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa05_fa10_beide_rollen_koennen_regulaer_importieren(self):
+        """Beide Rollen speichern eine echte XLSX-Datei und erhalten nur die Erfolgsbestätigung."""
+        for rolle, studienname in [
+            (Benutzerkonto.LEHRPERSON, "Upload Lehrperson"),
+            (Benutzerkonto.ADMINISTRATOR, "Upload Administration"),
+        ]:
+            with self.subTest(rolle=rolle):
+                self._melde_testkonto_an(rolle)
+                self.mappe.active["B1"] = studienname
+                vorherige_untersuchungen = list(
+                    Untersuchung.objects.order_by("pk").values()
+                )
+                vorherige_teilnahmen = list(
+                    Teilnahme.objects.order_by("pk").values()
+                )
+
+                antwort = self._post({"excel_datei": self._upload()})
+
+                self.assertEqual(antwort.status_code, 200)
+                self.assertEqual(antwort.json(), {
+                    "erfolg": True,
+                    "nachricht": "Import erfolgreich.",
+                })
+                # Die Antwort allein belegt keine Speicherung. Die echte
+                # Importfunktion muss Untersuchung und beide Teilnahmen anlegen.
+                neu = Untersuchung.objects.get(studienname=studienname)
+                self.assertEqual(neu.stundenwert, 0.5)
+                self.assertEqual(neu.einordnung, Untersuchung.PRAESENZ)
+                self.assertEqual(neu.lehrperson, "Testlehrperson Neu")
+                self.assertEqual(
+                    list(Teilnahme.objects.filter(
+                        untersuchung=neu
+                    ).order_by("matrikelnummer").values_list("matrikelnummer", flat=True)),
+                    ["1234567", "2345678"],
+                )
+                self.assertEqual(
+                    list(Untersuchung.objects.exclude(
+                        pk=neu.pk
+                    ).order_by("pk").values()),
+                    vorherige_untersuchungen,
+                )
+                self.assertEqual(
+                    list(Teilnahme.objects.exclude(
+                        untersuchung=neu
+                    ).order_by("pk").values()),
+                    vorherige_teilnahmen,
+                )
+
+    def test_fa05_get_anfrage_wird_abgewiesen(self):
+        """GET wird mit POST als erlaubter Methode vor dem Importaufruf abgewiesen."""
+        with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+            antwort = self.client.get(self.url)
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "HTTP-Methode nicht erlaubt.",
+        })
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_qa04_upload_ohne_anmeldung_wird_abgewiesen(self):
+        """Ein gültiger Upload ohne Anmeldung erreicht die Importfunktion nicht."""
+        # Ein gültiger CSRF-Token isoliert die fehlende Anmeldung als Ursache.
+        with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+            antwort = self._post({"excel_datei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Zugriff verweigert.",
+        })
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_qa03_abgelaufene_sitzung_verhindert_upload(self):
+        """Ein Upload mit abgelaufener Sitzung wird vor dem Import abgewiesen."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        sitzung = self.client.session
+        # Nur den Sitzungszeitwert zurücksetzen, statt die Frist abzuwarten.
+        sitzung["letzte_aktivitaet"] = (
+            timezone.now().timestamp() - settings.SITZUNG_INAKTIVITAET_SEKUNDEN - 1
+        )
+        sitzung.save()
+
+        with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+            antwort = self._post({"excel_datei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Zugriff verweigert.",
+        })
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_fa05_fehlender_dateiupload_wird_abgewiesen(self):
+        """Eine fehlende Datei und ein bloßer Dateiname im Textfeld genügen nicht."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        for daten in [{}, {"excel_datei": "untersuchung.xlsx"}]:
+            with self.subTest(daten=daten):
+                with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+                    antwort = self._post(daten)
+
+                self.assertEqual(antwort.status_code, 400)
+                self.assertEqual(antwort.json(), {
+                    "erfolg": False,
+                    "nachricht": "Keine Datei hochgeladen.",
+                })
+                importfunktion.assert_not_called()
+                self._pruefe_unveraenderten_bestand()
+
+    def test_fa09_importfehler_werden_vollstaendig_zurueckgegeben(self):
+        """Die View gibt mehrere echte Zellfehler zurück, ohne gültige Teile zu speichern."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        self.mappe.active["B2"] = 0.25
+        self.mappe.active["B3"] = "X"
+
+        antwort = self._post({"excel_datei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Import fehlgeschlagen.",
+            "fehlerliste": [
+                "B2: Der Stundenwert muss ein Vielfaches von 0,5 sein.",
+                "B3: Die Einordnung muss exakt P oder O sein.",
+            ],
+        })
+        self._pruefe_unveraenderten_bestand()
+
+    def test_csrf_fehlender_oder_falscher_token_verhindert_upload(self):
+        """Die CSRF-Middleware weist angemeldete Uploads ohne passenden Token ab."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        token = self.client.cookies[settings.CSRF_COOKIE_NAME].value
+        # Ein Zeichen ändern: Der falsche Token bleibt formal gültig,
+        # stimmt aber sicher nicht mehr mit dem vorhandenen Cookie überein.
+        falsches_token = ("a" if token[0] != "a" else "b") + token[1:]
+        for prueftoken in [None, falsches_token]:
+            with self.subTest(csrf_token=prueftoken):
+                kopfdaten = (
+                    {} if prueftoken is None else {"HTTP_X_CSRFTOKEN": prueftoken}
+                )
+                with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+                    antwort = self.client.post(
+                        self.url,
+                        data={"excel_datei": self._upload()},
+                        **kopfdaten,
+                    )
+
+                # Diese Abweisung kommt vor der View von Django und ist
+                # deshalb keine JSON-Fehlerantwort der Import-View.
+                self.assertEqual(antwort.status_code, 403)
+                importfunktion.assert_not_called()
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_falsch_zugeordneter_temporaerer_upload_wird_entfernt(self):
+        """Django entfernt auch eine vor dem Import abgewiesene temporäre Uploaddatei."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+        with TemporaryDirectory() as verzeichnis:
+            with self.settings(
+                FILE_UPLOAD_MAX_MEMORY_SIZE=0,
+                FILE_UPLOAD_TEMP_DIR=verzeichnis,
+            ):
+                with patch("vp_stunden.views.importiere_untersuchung") as importfunktion:
+                    antwort = self._post({"anderes_feld": self._upload()})
+
+                self.assertEqual(antwort.status_code, 400)
+                self.assertEqual(antwort.json(), {
+                    "erfolg": False,
+                    "nachricht": "Keine Datei hochgeladen.",
+                })
+                importfunktion.assert_not_called()
+
+                # Der andere Feldname verhindert den Importaufruf. Das Lesen
+                # der Anfrage hat dennoch einen echten Datenträgerupload erzeugt.
+                # Der Testclient schließt die Anfrage vor Rückgabe der Antwort.
+                datei = antwort.wsgi_request.FILES["anderes_feld"]
+                self.assertIsInstance(datei, TemporaryUploadedFile)
+                self.assertTrue(datei.closed)
+                self.assertFalse(Path(datei.temporary_file_path()).exists())
+                self._pruefe_unveraenderten_bestand()
+
+
+class UebergangsimportViewTests(TestCase):
+    """Prüft den administrativen Übergangsimport über URL, Sitzung und CSRF-Schutz."""
+
+    def setUp(self):
+        """Bereitet Altbestand, eine gemischte Übergangsdatei und einen geschützten Client vor."""
+        self.url = "/uebergangsdatei_importieren/"
+        self.untersuchung = Untersuchung.objects.create(
+            studienname="Bestandsstudie",
+            studienname_vergleich="bestandsstudie",
+            stundenwert=1.5,
+            einordnung=Untersuchung.PRAESENZ,
+            lehrperson="Testlehrperson Alt",
+        )
+        Teilnahme.objects.create(
+            untersuchung=self.untersuchung,
+            matrikelnummer="9876543",
+        )
+        self.untersuchungsbestand = list(
+            Untersuchung.objects.order_by("pk").values()
+        )
+        self.teilnahmebestand = list(
+            Teilnahme.objects.order_by("pk").values()
+        )
+
+        self.mappe = Workbook()
+        self.addCleanup(self.mappe.close)
+        self.mappe.active.append([
+            "Matrikelnummer",
+            "Studienname",
+            "Stundenwert (VP-Stunden)",
+            "Einordnung (P/O)",
+            "Verantwortliche Lehrperson",
+        ])
+        # Beide Zeilen betreffen dieselbe Matrikelnummer. Die erste ergänzt
+        # eine vorhandene Untersuchung, die zweite legt eine neue an.
+        self.mappe.active.append([
+            1234567,
+            "Bestandsstudie",
+            1.5,
+            Untersuchung.PRAESENZ,
+            "Testlehrperson Alt",
+        ])
+        self.mappe.active.append([
+            1234567,
+            "Neue Übergangsstudie",
+            0.5,
+            Untersuchung.ONLINE,
+            "Testlehrperson Neu",
+        ])
+
+        # Die CSRF-Prüfung bleibt auch bei den übrigen Uploadtests aktiv.
+        # Das Testcookie ermöglicht zunächst die geschützte Anmeldung.
+        self.client = Client(enforce_csrf_checks=True)
+        anfrage = HttpRequest()
+        get_token(anfrage)
+        self.client.cookies[settings.CSRF_COOKIE_NAME] = anfrage.META["CSRF_COOKIE"]
+
+    def _melde_testkonto_an(self, rolle):
+        """Meldet ein synthetisches Rollenkonto mit den erforderlichen Sitzungszeitwerten an."""
+        benutzername = f"uebergang_{rolle}"
+        passwort = "a" * 64
+        konto, fehlerliste = lege_konto_an(benutzername, passwort, rolle)
+        self.assertIsNotNone(konto)
+        self.assertEqual(fehlerliste, [])
+
+        antwort = self.client.post(
+            "/anmelden/",
+            data={"benutzername": benutzername, "passwort": passwort},
+            HTTP_X_CSRFTOKEN=self.client.cookies[settings.CSRF_COOKIE_NAME].value,
+        )
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+
+    def _upload(self):
+        """Erzeugt für jede Anfrage einen eigenen XLSX-Upload im Arbeitsspeicher."""
+        with BytesIO() as puffer:
+            self.mappe.save(puffer)
+            datei = SimpleUploadedFile("uebergang.xlsx", puffer.getvalue())
+        self.addCleanup(datei.close)
+        return datei
+
+    def _post(self, daten):
+        """Sendet eine Übergangsimportanfrage mit dem aktuell gültigen CSRF-Token."""
+        # Die Anmeldung wechselt das CSRF-Geheimnis. Deshalb immer den
+        # aktuellen Cookiewert verwenden, nicht den Wert vor der Anmeldung.
+        return self.client.post(
+            self.url,
+            data=daten,
+            HTTP_X_CSRFTOKEN=self.client.cookies[settings.CSRF_COOKIE_NAME].value,
+        )
+
+    def _pruefe_unveraenderten_bestand(self):
+        """Vergleicht sämtliche Untersuchungs- und Teilnahmefeldwerte mit dem Altbestand."""
+        self.assertEqual(
+            list(Untersuchung.objects.order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_administrator_importiert_neue_und_vorhandene_untersuchung(self):
+        """Eine administrative Anfrage legt neue Daten an und erhält die vorhandene Untersuchung."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+
+        antwort = self._post({"uebergangsdatei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.json(), {
+            "erfolg": True,
+            "nachricht": "Import erfolgreich.",
+        })
+        # Die echte Importfunktion muss beide Zeilen gemeinsam übernehmen.
+        # Die Antwort enthält dabei keine gespeicherten Untersuchungsdaten.
+        neu = Untersuchung.objects.get(studienname="Neue Übergangsstudie")
+        self.assertEqual(neu.stundenwert, 0.5)
+        self.assertEqual(neu.einordnung, Untersuchung.ONLINE)
+        self.assertEqual(neu.lehrperson, "Testlehrperson Neu")
+        self.assertCountEqual(
+            list(Teilnahme.objects.filter(
+                matrikelnummer="1234567"
+            ).values_list("untersuchung_id", flat=True)),
+            [self.untersuchung.pk, neu.pk],
+        )
+        # Der vollständige Vergleich umfasst auch Schreibweise und Uploadzeitpunkt.
+        self.assertEqual(
+            list(Untersuchung.objects.exclude(
+                pk=neu.pk
+            ).order_by("pk").values()),
+            self.untersuchungsbestand,
+        )
+        self.assertEqual(
+            list(Teilnahme.objects.exclude(
+                matrikelnummer="1234567"
+            ).order_by("pk").values()),
+            self.teilnahmebestand,
+        )
+
+    def test_fa11_get_anfrage_wird_abgewiesen(self):
+        """GET wird mit POST als erlaubter Methode vor dem Importaufruf abgewiesen."""
+        with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+            antwort = self.client.get(self.url)
+
+        self.assertEqual(antwort.status_code, 405)
+        self.assertEqual(antwort.headers["Allow"], "POST")
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "HTTP-Methode nicht erlaubt.",
+        })
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_qa04_upload_ohne_anmeldung_wird_abgewiesen(self):
+        """Ein gültiger Übergangsupload ohne Anmeldung erreicht die Importfunktion nicht."""
+        # Ein gültiger CSRF-Token isoliert die fehlende Anmeldung als Ursache.
+        with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+            antwort = self._post({"uebergangsdatei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Zugriff verweigert.",
+        })
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_qa04_lehrperson_darf_keinen_uebergangsimport_ausfuehren(self):
+        """Eine angemeldete Lehrperson darf auch eine gültige Übergangsdatei nicht importieren."""
+        self._melde_testkonto_an(Benutzerkonto.LEHRPERSON)
+
+        with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+            antwort = self._post({"uebergangsdatei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Zugriff verweigert.",
+        })
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_qa03_abgelaufene_sitzung_verhindert_uebergangsimport(self):
+        """Ein administrativer Upload mit abgelaufener Sitzung wird vor dem Import abgewiesen."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        sitzung = self.client.session
+        # Nur den Sitzungszeitwert zurücksetzen, statt die Frist abzuwarten.
+        sitzung["letzte_aktivitaet"] = (
+            timezone.now().timestamp() - settings.SITZUNG_INAKTIVITAET_SEKUNDEN - 1
+        )
+        sitzung.save()
+
+        with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+            antwort = self._post({"uebergangsdatei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 403)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Zugriff verweigert.",
+        })
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        importfunktion.assert_not_called()
+        self._pruefe_unveraenderten_bestand()
+
+    def test_fa11_fehlender_dateiupload_wird_abgewiesen(self):
+        """Eine fehlende Datei und ein bloßer Dateiname im Textfeld genügen nicht."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        for daten in [{}, {"uebergangsdatei": "uebergang.xlsx"}]:
+            with self.subTest(daten=daten):
+                with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+                    antwort = self._post(daten)
+
+                self.assertEqual(antwort.status_code, 400)
+                self.assertEqual(antwort.json(), {
+                    "erfolg": False,
+                    "nachricht": "Keine Datei hochgeladen.",
+                })
+                importfunktion.assert_not_called()
+                self._pruefe_unveraenderten_bestand()
+
+    def test_fa11_importfehler_verhindern_auch_die_bestandsergaenzung(self):
+        """Fehler in der neuen Untersuchung verhindern auch die gültige Ergänzung der vorhandenen."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        self.mappe.active["C3"] = 0.25
+        self.mappe.active["D3"] = "X"
+
+        antwort = self._post({"uebergangsdatei": self._upload()})
+
+        self.assertEqual(antwort.status_code, 400)
+        self.assertEqual(antwort.json(), {
+            "erfolg": False,
+            "nachricht": "Import fehlgeschlagen.",
+            "fehlerliste": [
+                "C3: Der Stundenwert muss ein Vielfaches von 0,5 sein.",
+                "D3: Die Einordnung muss exakt P oder O sein.",
+            ],
+        })
+        self._pruefe_unveraenderten_bestand()
+
+    def test_csrf_fehlender_oder_falscher_token_verhindert_uebergangsimport(self):
+        """Die CSRF-Middleware weist administrative Uploads ohne passenden Token ab."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        token = self.client.cookies[settings.CSRF_COOKIE_NAME].value
+        # Ein Zeichen ändern: Der falsche Token bleibt formal gültig,
+        # stimmt aber sicher nicht mehr mit dem vorhandenen Cookie überein.
+        falsches_token = ("a" if token[0] != "a" else "b") + token[1:]
+        for prueftoken in [None, falsches_token]:
+            with self.subTest(csrf_token=prueftoken):
+                kopfdaten = (
+                    {} if prueftoken is None else {"HTTP_X_CSRFTOKEN": prueftoken}
+                )
+                with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+                    antwort = self.client.post(
+                        self.url,
+                        data={"uebergangsdatei": self._upload()},
+                        **kopfdaten,
+                    )
+
+                # Diese Abweisung kommt vor der View von Django und ist
+                # deshalb keine JSON-Fehlerantwort der Import-View.
+                self.assertEqual(antwort.status_code, 403)
+                importfunktion.assert_not_called()
+                self._pruefe_unveraenderten_bestand()
+
+    def test_qa06_falsch_zugeordneter_temporaerer_upload_wird_entfernt(self):
+        """Django entfernt auch eine vor dem Übergangsimport abgewiesene temporäre Uploaddatei."""
+        self._melde_testkonto_an(Benutzerkonto.ADMINISTRATOR)
+        with TemporaryDirectory() as verzeichnis:
+            with self.settings(
+                FILE_UPLOAD_MAX_MEMORY_SIZE=0,
+                FILE_UPLOAD_TEMP_DIR=verzeichnis,
+            ):
+                with patch("vp_stunden.views.importiere_uebergangsdatei") as importfunktion:
+                    antwort = self._post({"excel_datei": self._upload()})
+
+                self.assertEqual(antwort.status_code, 400)
+                self.assertEqual(antwort.json(), {
+                    "erfolg": False,
+                    "nachricht": "Keine Datei hochgeladen.",
+                })
+                importfunktion.assert_not_called()
+
+                # Die Übergangsdatei liegt im Feld des regulären Uploads.
+                # Django hat sie eingelesen, die View akzeptiert dieses Feld aber nicht.
+                # Der Testclient schließt die Anfrage vor Rückgabe der Antwort.
+                datei = antwort.wsgi_request.FILES["excel_datei"]
+                self.assertIsInstance(datei, TemporaryUploadedFile)
+                self.assertTrue(datei.closed)
+                self.assertFalse(Path(datei.temporary_file_path()).exists())
+                self._pruefe_unveraenderten_bestand()

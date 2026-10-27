@@ -5,6 +5,7 @@ from vp_stunden.sicherheit import melde_an, melde_ab, aendere_passwort, pruefe_z
 from vp_stunden.models import Benutzerkonto
 from vp_stunden.vp_daten import loesche_teilnahmedaten,suche_teilnahmen, berechne_stunden, suche_untersuchungen, korrigiere_untersuchung
 from vp_stunden.reports import erzeuge_report
+from vp_stunden.importe import importiere_untersuchung, importiere_uebergangsdatei
 
 def melde_an_view(anfrage: HttpRequest) -> JsonResponse:
     """
@@ -695,7 +696,18 @@ def erzeuge_report_view(anfrage: HttpRequest) -> HttpResponse:
     :param anfrage: Die HTTP-Anfrage mit der Matrikelnummer.
     :return: Eine PDF-Downloadantwort oder eine JSON-Fehlerantwort.
 
-
+    1. Überprüft, ob die HTTP-Methode der Anfrage POST ist.
+    2. Wenn die Methode nicht POST ist, gibt eine JSON-Antwort mit einem Fehlerstatus und einer entsprechenden Nachricht zurück.
+    3. Prüft den Zugriff für Administratoren.
+    4. Extrahiert die Matrikelnummer aus der Anfrage.
+    5. Überprüft, ob die Matrikelnummer vorhanden ist.
+    6. Ruft die Funktion suche_teilnahmen() auf, um die Teilnahmedaten zu suchen.
+    7. Überprüft, ob Teilnahmedaten gefunden wurden.
+    8. Berechnet die Stundenwerte und den Erfüllungsstatus der gefundenen Teilnahmen.
+    9. Überprüft, ob die Mindestvorgaben für einen Report erfüllt sind.
+    10. Sortiert die gefundenen Teilnahmen nach ihrer internen ID aufsteigend.
+    11. Ruft die Funktion erzeuge_report() auf, um den PDF-Inhalt zu erzeugen.
+    12. Gibt eine PDF-Downloadantwort zurück, die den PDF-Inhalt enthält und den vorgeschlagenen Downloadnamen mit der Matrikelnummer angibt.
     """
 
     # Nur POST-Anfragen zulassen
@@ -783,3 +795,121 @@ def erzeuge_report_view(anfrage: HttpRequest) -> HttpResponse:
             ),
         },
     )
+
+def importiere_untersuchung_view(anfrage: HttpRequest) -> JsonResponse:
+    """
+    Verarbeitet eine HTTP-Anfrage zum regulären Excel-Import.
+
+    :param anfrage: Die HTTP-Anfrage mit der Excel-Datei.
+    :return: Eine JSON-Antwort zum Ergebnis des Imports.
+
+
+    """
+
+    # Nur POST-Anfragen zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Den Zugriff für Administratoren und Lehrpersonen zulassen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR, Benutzerkonto.LEHRPERSON])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Die Excel-Datei aus der Anfrage extrahieren
+    excel_datei = anfrage.FILES.get('excel_datei')
+
+    # Überprüfen, ob eine Datei hochgeladen wurde
+    if not excel_datei:
+        return JsonResponse({'erfolg': False, 'nachricht': 'Keine Datei hochgeladen.'}, status=400)
+
+    # Die Importfunktion prüft die gesamte Datei und speichert nur gültige Daten.
+    fehlerliste = importiere_untersuchung(excel_datei)
+
+    if fehlerliste:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Import fehlgeschlagen.',
+                'fehlerliste': fehlerliste  # Liste der Fehler zurückgeben
+            },
+            status=400  # HTTP-Statuscode: Die Anfrage wurde wegen fehlerhafter Angaben abgewiesen
+        )
+    else:
+        return JsonResponse(
+            {
+                'erfolg': True,
+                'nachricht': 'Import erfolgreich.'
+            }
+        )
+
+
+def importiere_uebergangsdatei_view(anfrage: HttpRequest) -> JsonResponse:
+    """
+    Verarbeitet eine HTTP-Anfrage zum Import einer Übergangsdatei.
+
+    :param anfrage: Die HTTP-Anfrage mit der Übergangsdatei.
+    :return: Eine JSON-Antwort zum Ergebnis des Imports.
+
+    """
+
+    # Nur POST-Anfragen zulassen
+    if anfrage.method != 'POST':
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'HTTP-Methode nicht erlaubt.'
+            },
+            status=405,  # Die verwendete HTTP-Methode ist nicht zugelassen
+            headers={'Allow': 'POST'}  # Der Allow-Header nennt die erlaubte Methode
+        )
+
+    # Den Zugriff nur für Administratoren zulassen
+    fehlerliste_zugriff = pruefe_zugriff(anfrage, [Benutzerkonto.ADMINISTRATOR])
+    if fehlerliste_zugriff:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Zugriff verweigert.'
+            },
+            status=403  # Der Zugriff auf die Aktion ist nicht gestattet
+        )
+
+    # Die Übergangsdatei aus der Anfrage extrahieren
+    uebergangsdatei = anfrage.FILES.get('uebergangsdatei')
+
+    # Überprüfen, ob eine Datei hochgeladen wurde
+    if not uebergangsdatei:
+        return JsonResponse({'erfolg': False, 'nachricht': 'Keine Datei hochgeladen.'}, status=400)
+
+    # Die Importfunktion prüft die gesamte Datei und speichert nur gültige Daten.
+    fehlerliste = importiere_uebergangsdatei(uebergangsdatei)
+
+    if fehlerliste:
+        return JsonResponse(
+            {
+                'erfolg': False,
+                'nachricht': 'Import fehlgeschlagen.',
+                'fehlerliste': fehlerliste  # Liste der Fehler zurückgeben
+            },
+            status=400  # HTTP-Statuscode: Die Anfrage wurde wegen fehlerhafter Angaben abgewiesen
+        )
+    else:
+        return JsonResponse(
+            {
+                'erfolg': True,
+                'nachricht': 'Import erfolgreich.'
+            }
+        )
