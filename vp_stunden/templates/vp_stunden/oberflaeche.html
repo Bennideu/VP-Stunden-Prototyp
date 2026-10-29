@@ -1,0 +1,358 @@
+{% load static %} {# Das static-Tag für die Pfade der JavaScriptdateien bereitstellen. #}
+<!doctype html>
+<html lang="de">
+
+<head>
+  <!-- Zeichencodierung und Titel des Browsertabs festlegen. -->
+  <meta charset="utf-8">
+  <title>VP-Stundenverwaltung</title>
+
+  <style>
+    /* Gemeinsame Tabellenlinien und Abstand zum vorherigen Inhalt festlegen. */
+    table {
+      border-collapse: collapse;
+      margin-top: 1rem;
+    }
+
+    /* Eine leere Korrekturfehlerliste soll keinen zusätzlichen Platz beanspruchen. */
+    #korrekturfehler:empty {
+      display: none;
+    }
+
+    /* Kopf- und Datenzellen einrahmen, mit Innenabstand versehen und zentrieren. */
+    th,
+    td {
+      border: 1px solid #888;
+      padding: 0.4rem 0.6rem;
+      text-align: center;
+    }
+
+    /* Horizontale Trennlinien zwischen den Funktionsbereichen gestalten. */
+    hr {
+      border: 0;
+      border-top: 1px solid #888;
+      margin: 1.5rem 0;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Gemeinsame Hauptüberschrift für alle Ansichten anzeigen. -->
+  <h1>Verwaltung von Versuchspersonenstunden</h1>
+
+  {# Anmeldung und Rolle bestimmen die Ansicht. Backendaktionen prüfen Berechtigungen separat. #}
+  {% if user.is_authenticated %}
+
+  <!-- Den Bereich über die Adresse auswählen und den aktiven Navigationspunkt kennzeichnen. -->
+  <nav aria-label="Hauptnavigation">
+    <ul>
+      <li>
+        <a href="/?bereich=administration"{% if bereich == "administration" %} aria-current="page"{% endif %}>
+          {% if user.rolle == "Administrator" %}Administration{% else %}Eigenes Passwort{% endif %}
+        </a>
+      </li>
+      <li>
+        <a href="/?bereich=importe"{% if bereich == "importe" %} aria-current="page"{% endif %}>Importe</a>
+      </li>
+      {% if user.rolle == "Administrator" %}
+      <li>
+        <a href="/?bereich=suche"{% if bereich == "suche" %} aria-current="page"{% endif %}>Suche</a>
+      </li>
+      {% endif %}
+    </ul>
+  </nav>
+
+  <!-- Die Abmeldung auf allen angemeldeten Seiten bereitstellen. -->
+  <form id="abmeldeformular" method="post" action="/abmelden/">
+    {% csrf_token %} {# Ein verborgenes Formularfeld für Djangos CSRF-Prüfung einfügen. #}
+    <button type="submit">Abmelden</button>
+  </form>
+
+  <div id="abmeldung" role="status"></div>
+  <!-- Module ermöglichen Imports und werden nach dem Aufbau des HTML-Dokuments ausgeführt. -->
+  <script type="module" src="{% static 'vp_stunden/abmeldung.js' %}"></script>
+
+  {# Die View übergibt bereich und bestimmt damit die ausgegebene Formulargruppe. #}
+  <main>
+    {% if bereich == "administration" %}
+
+    {# Kontoanlage und administrative Passwortzurücksetzung nur für Administrator:innen ausgeben. #}
+    {% if user.rolle == "Administrator" %}
+    <!-- <h2>Administration</h2> -->
+    <hr>
+    <h2>Benutzerkonto anlegen</h2>
+    <p>Das Passwort muss mindestens 15 Zeichen lang sein.</p>
+
+    <!-- Ein lokales Konto mit Benutzername, Passwort und einer der beiden Rollen anlegen. -->
+    <form id="kontoformular" method="post" action="/konto_anlegen/">
+      {% csrf_token %}
+
+      <!-- id verbindet Feld, Beschriftung und JavaScript, name benennt den übertragenen Parameter. -->
+      <label for="konto_benutzername">Benutzername:</label>
+      <input type="text" id="konto_benutzername" name="benutzername" required>
+
+      <!-- required verlangt eine Eingabe im Browser, die vollständige Prüfung erfolgt im Backend. -->
+      <label for="konto_passwort">Passwort:</label>
+      <input type="password" id="konto_passwort" name="passwort" required>
+
+      <label for="konto_rolle">Rolle:</label>
+      <select id="konto_rolle" name="rolle" required>
+        <option value="Lehrperson">Lehrperson</option>
+        <option value="Administrator">Administrator:in</option>
+      </select>
+
+      <button type="submit">Konto anlegen</button>
+    </form>
+
+    <!-- JavaScript füllt Status und Fehlerliste, role="status" kennzeichnet die Statusmeldung. -->
+    <div id="kontomeldung" role="status"></div>
+    <ul id="kontofehler"></ul>
+    <script type="module" src="{% static 'vp_stunden/konto_anlegen.js' %}"></script>
+    <hr>
+    <h2>Passwort zurücksetzen</h2>
+    <p>Das neue Passwort muss mindestens 15 Zeichen lang sein.</p>
+
+    <!-- Ein bestehendes Konto auswählen und ein neues Passwort für dieses Konto übermitteln. -->
+    <form id="ruecksetzformular" method="post" action="/passwort_zuruecksetzen/">
+      {% csrf_token %}
+
+      <label for="ruecksetz_konto">Benutzerkonto:</label>
+      <select id="ruecksetz_konto" name="konto_id" required>
+        <option value="">Bitte auswählen</option>
+        {# Die von der View geladenen Konten mit ihrer internen ID als Auswahloptionen ausgeben. #}
+        {% for konto in konten %}
+        <option value="{{ konto.id }}">{{ konto.username }} ({{ konto.rolle }})</option>
+        {% endfor %}
+      </select>
+
+      <label for="ruecksetz_passwort">Neues Passwort:</label>
+      <input type="password" id="ruecksetz_passwort" name="neues_passwort" required>
+
+      <button type="submit">Passwort zurücksetzen</button>
+    </form>
+
+    <div id="ruecksetzmeldung" role="status"></div>
+    <ul id="ruecksetzfehler"></ul>
+    <script type="module" src="{% static 'vp_stunden/passwort_zuruecksetzen.js' %}"></script>
+
+    {% else %}
+    <h2>Benutzerkonto</h2>
+    {% endif %}
+    <hr>
+    <h2>Eigenes Passwort ändern</h2>
+    <p>Das neue Passwort muss mindestens 15 Zeichen lang sein.</p>
+
+    <!-- Die eigene Passwortänderung für beide Rollen mit bisherigem Passwort und Wiederholung anbieten. -->
+    <form id="passwortformular" method="post" action="/passwort_aendern/">
+      {% csrf_token %}
+
+      <label for="bisheriges_passwort">Bisheriges Passwort:</label>
+      <input type="password" id="bisheriges_passwort" name="bisheriges_passwort" required>
+
+      <label for="neues_passwort">Neues Passwort:</label>
+      <input type="password" id="neues_passwort" name="neues_passwort" required>
+
+      <label for="wiederholung_neues_passwort">Neues Passwort wiederholen:</label>
+      <input type="password" id="wiederholung_neues_passwort" name="wiederholung_neues_passwort" required>
+
+      <button type="submit">Passwort ändern</button>
+    </form>
+
+    <div id="passwortmeldung" role="status"></div>
+    <ul id="passwortfehler"></ul>
+    <script type="module" src="{% static 'vp_stunden/passwort_aendern.js' %}"></script>
+
+    {% elif bereich == "importe" %}
+
+    <hr>
+    <!-- <h2>Importe</h2> -->
+
+    <h2>Regulärer Upload</h2>
+    <p>Eine Untersuchungsdatei im Format .xlsx, maximal 2 MB.</p>
+
+    <!-- Das Uploadformular sieht Dateiversand vor, JavaScript überträgt die Felder als FormData. -->
+    <form id="untersuchungsformular" method="post" action="/untersuchung_importieren/" enctype="multipart/form-data">
+      {% csrf_token %}
+
+      <!-- accept ist ein Auswahlhinweis, die verbindliche Datei- und Inhaltsprüfung erfolgt im Backend. -->
+      <label for="excel_datei">Excel-Datei:</label>
+      <input type="file" id="excel_datei" name="excel_datei" accept=".xlsx" required>
+
+      <button type="submit">Hochladen</button>
+    </form>
+
+    <div id="untersuchungsmeldung" role="status"></div>
+    <ul id="untersuchungsfehler"></ul>
+    <script type="module" src="{% static 'vp_stunden/untersuchung_importieren.js' %}"></script>
+
+    {# Den zusätzlichen Übergangsimport ausschließlich für Administrator:innen ausgeben. #}
+    {% if user.rolle == "Administrator" %}
+    <hr>
+    <h2>Übergangsimport</h2>
+    <p>Eine Übergangsdatei im Format .xlsx, maximal 2 MB.</p>
+
+    <!-- Die Übergangsdatei über ein eigenes Formular an den zugehörigen Import-Endpunkt senden. -->
+    <form id="uebergangsformular" method="post" action="/uebergangsdatei_importieren/" enctype="multipart/form-data">
+      {% csrf_token %}
+
+      <label for="uebergangsdatei">Übergangsdatei:</label>
+      <input type="file" id="uebergangsdatei" name="uebergangsdatei" accept=".xlsx" required>
+
+      <button type="submit">Hochladen</button>
+    </form>
+
+    <div id="uebergangsmeldung" role="status"></div>
+    <ul id="uebergangsfehler"></ul>
+    <script type="module" src="{% static 'vp_stunden/uebergangsdatei_importieren.js' %}"></script>
+
+    {% endif %}
+
+    {# Beide miteinander verknüpften Suchanzeigen auf der administrativen Suchseite bereitstellen. #}
+    {% elif bereich == "suche" and user.rolle == "Administrator" %}
+
+    <!-- <h2>Suche</h2> -->
+    <hr>
+    <h2>Teilnahmen suchen</h2>
+    <p>Die vollständige siebenstellige Matrikelnummer eingeben.</p>
+
+    <!-- Teilnahmen anhand der übermittelten Matrikelnummer suchen. -->
+    <form id="teilnahmeformular" method="post" action="/teilnahmen_suchen/">
+      {% csrf_token %}
+
+      <label for="suche_matrikelnummer">Matrikelnummer:</label>
+      <input type="text" id="suche_matrikelnummer" name="matrikelnummer" required>
+
+      <button type="submit">Suchen</button>
+    </form>
+
+    <div id="teilnahmemeldung" role="status"></div>
+
+    <!-- Spaltenüberschriften fest vorgeben, die Ergebniszeilen ergänzt JavaScript im leeren tbody. -->
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Matrikelnummer</th>
+          <th scope="col">Studienname</th>
+          <th scope="col">VP-Stunden</th>
+          <th scope="col">P/O</th>
+          <th scope="col">Verantwortliche Lehrperson</th>
+          <th scope="col">Uploadzeitpunkt (deutsche Ortszeit)</th>
+        </tr>
+      </thead>
+      <tbody id="teilnahmezeilen"></tbody>
+    </table>
+
+    <!-- Die vom Backend gelieferten Stundensummen und den Erfüllungsstatus anzeigen. -->
+    <p id="stundenberechnung"></p>
+
+    <h3>PDF-Report</h3>
+    <p>Bei erfüllten Mindestvorgaben kann für die angezeigte Matrikelnummer ein PDF-Report heruntergeladen werden. Der Report ist außerhalb des Systems zu speichern.</p>
+
+    <form id="reportformular" method="post" action="/report_erzeugen/">
+      {% csrf_token %}
+
+      <!-- JavaScript übernimmt hier die Matrikelnummer der tatsächlich angezeigten Suchergebnisse. -->
+      <input type="hidden" id="report_matrikelnummer" name="matrikelnummer" value="">
+
+      <!-- Anfangs sperren, JavaScript gibt den Button entsprechend dem geladenen Backendstatus frei. -->
+      <button type="submit" disabled>PDF-Report herunterladen</button>
+    </form>
+
+    <!-- Reportmeldungen getrennt von Suchmeldungen ausgeben. -->
+    <div id="reportmeldung" role="status"></div>
+
+    <h4>Teilnahmedaten löschen</h4>
+    <p>Gelöscht werden sämtliche Teilnahmen der angezeigten Matrikelnummer. Dadurch leer werdende Untersuchungen werden ebenfalls entfernt.</p>
+
+    <!-- Eine Löschanfrage mit angezeigter Matrikelnummer und ausdrücklicher Ablagebestätigung vorbereiten. -->
+    <form id="loeschformular" method="post" action="/teilnahmedaten_loeschen/">
+      {% csrf_token %}
+
+      <input type="hidden" id="loesch_matrikelnummer" name="matrikelnummer" value="">
+
+      <!-- Die gesetzte Checkbox übermittelt true, required verlangt die Bestätigung im Browser. -->
+      <p>
+        <input type="checkbox"
+               id="loesch_ablage_bestaetigt"
+               name="ablage_bestaetigt"
+               value="true"
+               required>
+        <label for="loesch_ablage_bestaetigt">Der Report wurde heruntergeladen und außerhalb des Systems gespeichert.</label>
+      </p>
+
+      <button type="submit" disabled>Teilnahmedaten dieser Matrikelnummer löschen</button>
+    </form>
+
+    <div id="loeschmeldung" role="status"></div>
+    <ul id="loeschfehler"></ul>
+
+    <!-- Das Teilnahmesuchmodul verwaltet auch Reportabruf und Zuordnung der Löschaktion. -->
+    <script type="module" src="{% static 'vp_stunden/teilnahmen_suchen.js' %}"></script>
+    <hr>
+    <h2>Untersuchungen suchen</h2>
+    <p>Studienname oder Namensteil eingeben. Ein leeres Suchfeld zeigt alle Untersuchungen.</p>
+
+    <!-- Der Suchtext darf leer bleiben, damit die vollständige Untersuchungsübersicht abrufbar ist. -->
+    <form id="studienformular" method="post" action="/untersuchungen_suchen/">
+      {% csrf_token %}
+
+      <label for="suche_studienname">Studienname oder Namensteil:</label>
+      <input type="text" id="suche_studienname" name="suchtext">
+
+      <button type="submit">Suchen</button>
+    </form>
+
+    <!-- Suchmeldung und Rückmeldung einer Inlinekorrektur voneinander getrennt halten. -->
+    <div id="studienmeldung" role="status"></div>
+
+    <div id="korrekturmeldung" role="status"></div>
+    <ul id="korrekturfehler"></ul>
+
+    <!-- JavaScript ergänzt Untersuchungszeilen und öffnet die Bearbeitung direkt in den Zellen. -->
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Studienname</th>
+          <th scope="col">VP-Stunden</th>
+          <th scope="col">P/O</th>
+          <th scope="col">Verantwortliche Lehrperson</th>
+          <th scope="col">Uploadzeitpunkt (deutsche Ortszeit)</th>
+          <th scope="col">Aktion</th>
+        </tr>
+      </thead>
+      <tbody id="studienzeilen"></tbody>
+    </table>
+
+    <!-- Untersuchungssuche und Löschung nutzen auch die Funktionen der Teilnahmesuche. -->
+    <script type="module" src="{% static 'vp_stunden/untersuchungen_suchen.js' %}"></script>
+    <script type="module" src="{% static 'vp_stunden/teilnahmedaten_loeschen.js' %}"></script>
+
+    {% endif %}
+  </main>
+
+  {# Ohne Anmeldung den Anmeldebereich statt der Verwaltungsfunktionen ausgeben. #}
+  {% else %}
+
+  <h2>Anmeldung</h2>
+
+  <!-- Benutzername und Passwort an den vorhandenen Anmelde-Endpunkt übermitteln. -->
+  <form id="anmeldeformular" method="post" action="/anmelden/">
+    {% csrf_token %}
+
+    <label for="benutzername">Benutzername:</label>
+    <input type="text" name="benutzername" id="benutzername" required>
+
+    <label for="passwort">Passwort:</label>
+    <input type="password" name="passwort" id="passwort" required>
+
+    <button type="submit">Anmelden</button>
+  </form>
+
+  <div id="anmeldung" role="status"></div>
+  <!-- Die Anmeldung asynchron senden und nach Erfolg die Rollenansicht neu laden. -->
+  <script type="module" src="{% static 'vp_stunden/anmeldung.js' %}"></script>
+
+  {% endif %}
+</body>
+
+</html>

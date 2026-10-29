@@ -1,5 +1,6 @@
 from html import escape  # Maskiert Sonderzeichen für die Markup-Verarbeitung von Paragraph.
 from io import BytesIO  # Stellt einen binären Speicherpuffer für den PDF-Inhalt bereit.
+from zoneinfo import ZoneInfo
 
 from django.utils import timezone  # Liefert den serverseitigen Zeitpunkt mit Zeitzoneninformation.
 from reportlab.lib import colors  # Enthält Farbwerte für Tabellenhintergrund und Rasterlinien.
@@ -47,8 +48,11 @@ def erzeuge_report(
 
         stile = getSampleStyleSheet()
 
-        # Den Erzeugungszeitpunkt einmal mit Sekunden und UTC-Offset festhalten.
-        erzeugungszeitpunkt = timezone.now().isoformat(timespec="seconds")
+        # Den Erzeugungszeitpunkt in Berliner Ortszeit mit UTC-Offset ausgeben.
+        erzeugungszeitpunkt = timezone.localtime(
+            timezone.now(),
+            ZoneInfo("Europe/Berlin"),
+        ).isoformat(timespec="seconds")
 
         # Die Reihenfolge dieser Liste bestimmt die Reihenfolge im Dokument.
         inhalt = [
@@ -70,10 +74,7 @@ def erzeuge_report(
         tabellendaten = [
             [
                 Paragraph("<b>Studienname</b>", stile["Normal"]),
-                Paragraph(
-                    "<b>Verantwortliche Lehrperson</b>",
-                    stile["Normal"],
-                ),
+                Paragraph("<b>Verantwortliche Lehrperson</b>",stile["Normal"],),
                 Paragraph("<b>Stundenwert</b>", stile["Normal"]),
                 Paragraph("<b>P/O</b>", stile["Normal"]),
             ]

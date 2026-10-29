@@ -913,3 +913,40 @@ def importiere_uebergangsdatei_view(anfrage: HttpRequest) -> JsonResponse:
                 'nachricht': 'Import erfolgreich.'
             }
         )
+
+def zeige_oberflaeche_view(anfrage: HttpRequest) -> HttpResponse:
+    """Liefert den gewählten Oberflächenbereich mit den erlaubten Funktionen."""
+    # Der Adresszusatz bestimmt den angezeigten Bereich.
+    bereich = anfrage.GET.get("bereich", "importe")
+    if bereich not in ("administration", "importe", "suche"):
+        bereich = "importe"
+
+    # Der Suchbereich ist ausschließlich für Administrator:innen vorgesehen.
+    if bereich == "suche" and not (
+        anfrage.user.is_authenticated
+        and anfrage.user.rolle == Benutzerkonto.ADMINISTRATOR
+    ):
+        bereich = "importe"
+
+    konten = []
+
+    # Die vorhandene Sitzungs- und Rollenprüfung beibehalten.
+    if (
+        anfrage.user.is_authenticated
+        and anfrage.user.rolle == Benutzerkonto.ADMINISTRATOR
+    ):
+        fehlerliste_zugriff = pruefe_zugriff(
+            anfrage, [Benutzerkonto.ADMINISTRATOR]
+        )
+
+        # Die Kontenauswahl wird nur im Administrationsbereich benötigt.
+        if not fehlerliste_zugriff and bereich == "administration":
+            konten = Benutzerkonto.objects.values(
+                "id", "username", "rolle"
+            ).order_by("username")
+
+    return render(
+        anfrage,
+        "vp_stunden/oberflaeche.html",
+        {"konten": konten, "bereich": bereich},
+    )
