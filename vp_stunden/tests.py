@@ -6427,3 +6427,188 @@ class UebergangsimportViewTests(TestCase):
                 self.assertTrue(datei.closed)
                 self.assertFalse(Path(datei.temporary_file_path()).exists())
                 self._pruefe_unveraenderten_bestand()
+
+
+class OberflaecheViewTests(TestCase):
+    """Prüft Oberflächenzugriff, Sitzungsende und das lokale HTTP-Cookieprofil."""
+
+    def setUp(self):
+        """Legt zwei synthetische Rollenkonten für die Oberflächenprüfungen an."""
+        self.url = "/?bereich=administration"
+        self.passwort = "a" * 64
+
+        self.administratorkonto, fehlerliste = lege_konto_an(
+            "oberflaeche_admin",
+            self.passwort,
+            Benutzerkonto.ADMINISTRATOR,
+        )
+        self.assertIsNotNone(self.administratorkonto)
+        self.assertEqual(fehlerliste, [])
+
+        self.lehrpersonenkonto, fehlerliste = lege_konto_an(
+            "oberflaeche_lehrperson",
+            self.passwort,
+            Benutzerkonto.LEHRPERSON,
+        )
+        self.assertIsNotNone(self.lehrpersonenkonto)
+        self.assertEqual(fehlerliste, [])
+
+    def _melde_testkonto_an(self, konto):
+        """Meldet ein vorbereitetes Konto an und gibt die HTTP-Antwort zurück."""
+        # Die reguläre Anmeldung setzt auch Beginn und letzte Aktivität der Sitzung.
+        antwort = self.client.post(
+            "/anmelden/",
+            data={
+                "benutzername": konto.username,
+                "passwort": self.passwort,
+            },
+        )
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTrue(antwort.json()["erfolg"])
+        self.assertEqual(self.client.session[SESSION_KEY], str(konto.pk))
+        return antwort
+
+    def _pruefe_keine_administrationsdaten(self, antwort):
+        """Prüft, dass weder Kontendaten noch administrative Kontenformulare erscheinen."""
+        # Eine eingeschränkte HTML-Ansicht darf weiterhin mit HTTP 200 antworten.
+        self.assertEqual(antwort.status_code, 200)
+        self.assertEqual(antwort.context["konten"], [])
+
+        # Die eindeutigen Namen machen eine versehentliche Kontenausgabe erkennbar.
+        for konto in [self.administratorkonto, self.lehrpersonenkonto]:
+            self.assertNotContains(antwort, konto.username)
+
+        self.assertNotContains(antwort, 'id="kontoformular"')
+        self.assertNotContains(antwort, 'id="ruecksetzformular"')
+
+    def test_fa04_administrator_erhaelt_kontenauswahl(self):
+        """Eine gültige Administrationssitzung erhält die vollständige Kontenauswahl."""
+        self._melde_testkonto_an(self.administratorkonto)
+
+        antwort = self.client.get(self.url)
+
+        self.assertEqual(antwort.status_code, 200)
+        self.assertTemplateUsed(antwort, "vp_stunden/oberflaeche.html")
+
+        # Die View liefert genau die für die Auswahl vorgesehenen Kontenangaben.
+        self.assertEqual(
+            list(antwort.context["konten"]),
+            [
+                {
+                    "id": self.administratorkonto.pk,
+                    "username": self.administratorkonto.username,
+                    "rolle": Benutzerkonto.ADMINISTRATOR,
+                },
+                {
+                    "id": self.lehrpersonenkonto.pk,
+                    "username": self.lehrpersonenkonto.username,
+                    "rolle": Benutzerkonto.LEHRPERSON,
+                },
+            ],
+        )
+
+        # Zusätzlich zum Kontext die tatsächlich ausgegebenen HTML-Inhalte prüfen.
+        self.assertContains(antwort, self.administratorkonto.username)
+        self.assertContains(antwort, self.lehrpersonenkonto.username)
+        self.assertContains(antwort, 'id="kontoformular"')
+        self.assertContains(antwort, 'id="ruecksetzformular"')
+        self.assertContains(antwort, 'id="passwortformular"')
+
+    def test_qa04_ohne_anmeldung_erscheinen_keine_kontendaten(self):
+        """Ohne Anmeldung erscheint nur die Anmeldeansicht ohne Kontendaten."""
+        antwort = self.client.get(self.url)
+
+        self._pruefe_keine_administrationsdaten(antwort)
+        self.assertContains(antwort, 'id="anmeldeformular"')
+        self.assertNotContains(antwort, 'id="passwortformular"')
+        self.assertFalse(antwort.wsgi_request.user.is_authenticated)
+
+    def test_qa04_lehrperson_erhaelt_keine_kontendaten(self):
+        """Eine Lehrperson erhält nur die eigene Passwortfunktion ohne Kontenauswahl."""
+        self._melde_testkonto_an(self.lehrpersonenkonto)
+
+        antwort = self.client.get(self.url)
+
+        self._pruefe_keine_administrationsdaten(antwort)
+        self.assertContains(antwort, 'id="passwortformular"')
+        self.assertNotContains(antwort, 'id="anmeldeformular"')
+        self.assertTrue(antwort.wsgi_request.user.is_authenticated)
+
+    def test_qa03_abgelaufene_sitzung_verhindert_kontenausgabe(self):
+        """Beide Sitzungsfristen verhindern nach ihrem Erreichen die Kontenausgabe."""
+        jetzt = timezone.now()
+        zeitwert = jetzt.timestamp()
+        testfaelle = [
+            (
+                "inaktivitaet",
+                zeitwert - settings.SITZUNG_INAKTIVITAET_SEKUNDEN,
+                zeitwert - settings.SITZUNG_INAKTIVITAET_SEKUNDEN,
+            ),
+            (
+                "absolute_dauer",
+                zeitwert - settings.SITZUNG_MAX_DAUER_SEKUNDEN,
+                zeitwert,
+            ),
+        ]
+
+        for frist, sitzungsbeginn, letzte_aktivitaet in testfaelle:
+            with self.subTest(frist=frist):
+                # Jeder Teilfall erhält eine frisch angemeldete Sitzung.
+                self.client = Client()
+
+                # Eine feste Testzeit vermeidet Wartezeiten und ungenaue Grenzvergleiche.
+                with patch(
+                    "vp_stunden.sicherheit.timezone.now",
+                    return_value=jetzt,
+                ):
+                    self._melde_testkonto_an(self.administratorkonto)
+                    sitzung = self.client.session
+                    sitzung["sitzungsbeginn"] = sitzungsbeginn
+                    sitzung["letzte_aktivitaet"] = letzte_aktivitaet
+                    sitzung.save()
+
+                    antwort = self.client.get(self.url)
+
+                self._pruefe_keine_administrationsdaten(antwort)
+                self.assertContains(antwort, 'id="anmeldeformular"')
+                self.assertFalse(antwort.wsgi_request.user.is_authenticated)
+
+    def test_qa03_alte_sitzungskennung_erlaubt_keinen_kontenzugriff(self):
+        """Die vor der Abmeldung gesicherte Kennung ermöglicht keinen erneuten Zugriff."""
+        self._melde_testkonto_an(self.administratorkonto)
+        alte_sitzungskennung = self.client.cookies[
+            settings.SESSION_COOKIE_NAME
+        ].value
+
+        antwort_abmeldung = self.client.post("/abmelden/")
+        self.assertEqual(antwort_abmeldung.status_code, 200)
+        self.assertTrue(antwort_abmeldung.json()["erfolg"])
+
+        # Die alte Kennung absichtlich mit einem getrennten Client erneut senden.
+        neuer_client = Client()
+        neuer_client.cookies[settings.SESSION_COOKIE_NAME] = alte_sitzungskennung
+        antwort = neuer_client.get(self.url)
+
+        self._pruefe_keine_administrationsdaten(antwort)
+        self.assertContains(antwort, 'id="anmeldeformular"')
+        self.assertFalse(antwort.wsgi_request.user.is_authenticated)
+
+    def test_http_cookieprofil_entspricht_lokalem_pruefbetrieb(self):
+        """Die Anmeldeantwort setzt die vorgesehenen Cookieattribute für lokales HTTP."""
+        antwort = self._melde_testkonto_an(self.administratorkonto)
+
+        # Die tatsächlich gesetzten Antwortcookies statt nur Einstellungen prüfen.
+        self.assertIn(settings.SESSION_COOKIE_NAME, antwort.cookies)
+        self.assertIn(settings.CSRF_COOKIE_NAME, antwort.cookies)
+        sitzungscookie = antwort.cookies[settings.SESSION_COOKIE_NAME]
+        csrf_cookie = antwort.cookies[settings.CSRF_COOKIE_NAME]
+
+        # Eine leere Domain entspricht einem hostgebundenen Sitzungscookie.
+        self.assertEqual(sitzungscookie["domain"], "")
+        self.assertTrue(sitzungscookie["httponly"])
+        self.assertEqual(sitzungscookie["samesite"], "Lax")
+
+        # Im bestätigten HTTP-Prüfbetrieb darf Secure bei beiden Cookies fehlen.
+        self.assertFalse(sitzungscookie["secure"])
+        self.assertFalse(csrf_cookie["secure"])
